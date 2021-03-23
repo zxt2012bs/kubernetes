@@ -22,32 +22,27 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/pkg/errors"
 	"k8s.io/apimachinery/pkg/util/version"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/component-base/featuregate"
 )
 
 const (
-
-	// CoreDNS is GA in v1.11
-	CoreDNS = "CoreDNS"
-
-	// DynamicKubeletConfig is beta in v1.11
-	DynamicKubeletConfig = "DynamicKubeletConfig"
-
-	// Auditing is beta in 1.8
-	Auditing = "Auditing"
+	// IPv6DualStack is expected to be beta in v1.21
+	IPv6DualStack = "IPv6DualStack"
+	// PublicKeysECDSA is expected to be alpha in v1.19
+	PublicKeysECDSA = "PublicKeysECDSA"
 )
 
 // InitFeatureGates are the default feature gates for the init command
 var InitFeatureGates = FeatureList{
-	CoreDNS:              {FeatureSpec: utilfeature.FeatureSpec{Default: true, PreRelease: utilfeature.GA}},
-	DynamicKubeletConfig: {FeatureSpec: utilfeature.FeatureSpec{Default: false, PreRelease: utilfeature.Beta}},
-	Auditing:             {FeatureSpec: utilfeature.FeatureSpec{Default: false, PreRelease: utilfeature.Alpha}},
+	IPv6DualStack:   {FeatureSpec: featuregate.FeatureSpec{Default: true, PreRelease: featuregate.Beta}},
+	PublicKeysECDSA: {FeatureSpec: featuregate.FeatureSpec{Default: false, PreRelease: featuregate.Alpha}},
 }
 
 // Feature represents a feature being gated
 type Feature struct {
-	utilfeature.FeatureSpec
+	featuregate.FeatureSpec
 	MinimumVersion     *version.Version
 	HiddenInHelpText   bool
 	DeprecationMessage string
@@ -63,12 +58,12 @@ func ValidateVersion(allFeatures FeatureList, requestedFeatures map[string]bool,
 	}
 	parsedExpVersion, err := version.ParseSemantic(requestedVersion)
 	if err != nil {
-		return fmt.Errorf("Error parsing version %s: %v", requestedVersion, err)
+		return errors.Wrapf(err, "error parsing version %s", requestedVersion)
 	}
 	for k := range requestedFeatures {
 		if minVersion := allFeatures[k].MinimumVersion; minVersion != nil {
 			if !parsedExpVersion.AtLeast(minVersion) {
-				return fmt.Errorf(
+				return errors.Errorf(
 					"the requested Kubernetes version (%s) is incompatible with the %s feature gate, which needs %s as a minimum",
 					requestedVersion, k, minVersion)
 			}
@@ -88,9 +83,9 @@ func Enabled(featureList map[string]bool, featureName string) bool {
 // Supports indicates whether a feature name is supported on the given
 // feature set
 func Supports(featureList FeatureList, featureName string) bool {
-	for k := range featureList {
+	for k, v := range featureList {
 		if featureName == string(k) {
-			return true
+			return v.PreRelease != featuregate.Deprecated
 		}
 	}
 	return false
@@ -114,7 +109,7 @@ func KnownFeatures(f *FeatureList) []string {
 		}
 
 		pre := ""
-		if v.PreRelease != utilfeature.GA {
+		if v.PreRelease != featuregate.GA {
 			pre = fmt.Sprintf("%s - ", v.PreRelease)
 		}
 		known = append(known, fmt.Sprintf("%s=true|false (%sdefault=%t)", k, pre, v.Default))
@@ -134,7 +129,7 @@ func NewFeatureGate(f *FeatureList, value string) (map[string]bool, error) {
 
 		arr := strings.SplitN(s, "=", 2)
 		if len(arr) != 2 {
-			return nil, fmt.Errorf("missing bool value for feature-gate key:%s", s)
+			return nil, errors.Errorf("missing bool value for feature-gate key:%s", s)
 		}
 
 		k := strings.TrimSpace(arr[0])
@@ -142,16 +137,16 @@ func NewFeatureGate(f *FeatureList, value string) (map[string]bool, error) {
 
 		featureSpec, ok := (*f)[k]
 		if !ok {
-			return nil, fmt.Errorf("unrecognized feature-gate key: %s", k)
+			return nil, errors.Errorf("unrecognized feature-gate key: %s", k)
 		}
 
-		if featureSpec.PreRelease == utilfeature.Deprecated {
-			return nil, fmt.Errorf("feature-gate key is deprecated: %s", k)
+		if featureSpec.PreRelease == featuregate.Deprecated {
+			return nil, errors.Errorf("feature-gate key is deprecated: %s", k)
 		}
 
 		boolValue, err := strconv.ParseBool(v)
 		if err != nil {
-			return nil, fmt.Errorf("invalid value %v for feature-gate key: %s, use true|false instead", v, k)
+			return nil, errors.Errorf("invalid value %v for feature-gate key: %s, use true|false instead", v, k)
 		}
 		featureGate[k] = boolValue
 	}
@@ -172,7 +167,7 @@ func CheckDeprecatedFlags(f *FeatureList, features map[string]bool) map[string]s
 			deprecatedMsg[k] = fmt.Sprintf("Unknown feature gate flag: %s", k)
 		}
 
-		if featureSpec.PreRelease == utilfeature.Deprecated {
+		if featureSpec.PreRelease == featuregate.Deprecated {
 			if _, ok := deprecatedMsg[k]; !ok {
 				deprecatedMsg[k] = featureSpec.DeprecationMessage
 			}

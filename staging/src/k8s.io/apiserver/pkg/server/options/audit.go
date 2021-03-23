@@ -23,17 +23,21 @@ import (
 	"strings"
 	"time"
 
-	"github.com/golang/glog"
 	"github.com/spf13/pflag"
 	"gopkg.in/natefinch/lumberjack.v2"
+	"k8s.io/klog/v2"
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	utilnet "k8s.io/apimachinery/pkg/util/net"
+	auditinternal "k8s.io/apiserver/pkg/apis/audit"
 	auditv1 "k8s.io/apiserver/pkg/apis/audit/v1"
 	auditv1alpha1 "k8s.io/apiserver/pkg/apis/audit/v1alpha1"
 	auditv1beta1 "k8s.io/apiserver/pkg/apis/audit/v1beta1"
 	"k8s.io/apiserver/pkg/audit"
 	"k8s.io/apiserver/pkg/audit/policy"
 	"k8s.io/apiserver/pkg/server"
+	"k8s.io/apiserver/pkg/server/egressselector"
+	"k8s.io/apiserver/pkg/util/webhook"
 	pluginbuffered "k8s.io/apiserver/plugin/pkg/audit/buffered"
 	pluginlog "k8s.io/apiserver/plugin/pkg/audit/log"
 	plugintruncate "k8s.io/apiserver/plugin/pkg/audit/truncate"
@@ -53,6 +57,9 @@ const (
 func appendBackend(existing, newBackend audit.Backend) audit.Backend {
 	if existing == nil {
 		return newBackend
+	}
+	if newBackend == nil {
+		return existing
 	}
 	return audit.Union(existing, newBackend)
 }
@@ -76,12 +83,17 @@ const (
 	// a set of events. This causes requests to the API server to wait for the
 	// flush before sending a response.
 	ModeBlocking = "blocking"
+	// ModeBlockingStrict is the same as ModeBlocking, except when there is
+	// a failure during audit logging at RequestReceived stage, the whole
+	// request to apiserver will fail.
+	ModeBlockingStrict = "blocking-strict"
 )
 
 // AllowedModes is the modes known for audit backends.
 var AllowedModes = []string{
 	ModeBatch,
 	ModeBlocking,
+	ModeBlockingStrict,
 }
 
 type AuditBatchOptions struct {
@@ -109,6 +121,7 @@ type AuditLogOptions struct {
 	MaxBackups int
 	MaxSize    int
 	Format     string
+	Compress   bool
 
 	BatchOptions    AuditBatchOptions
 	TruncateOptions AuditTruncateOptions
@@ -129,10 +142,20 @@ type AuditWebhookOptions struct {
 	GroupVersionString string
 }
 
+// AuditDynamicOptions control the configuration of dynamic backends for audit events
+type AuditDynamicOptions struct {
+	// Enabled tells whether the dynamic audit capability is enabled.
+	Enabled bool
+
+	// Configuration for batching backend. This is currently only used as an override
+	// for integration tests
+	BatchConfig *pluginbuffered.BatchConfig
+}
+
 func NewAuditOptions() *AuditOptions {
 	return &AuditOptions{
 		WebhookOptions: AuditWebhookOptions{
-			InitialBackoff: pluginwebhook.DefaultInitialBackoff,
+			InitialBackoff: pluginwebhook.DefaultInitialBackoffDelay,
 			BatchOptions: AuditBatchOptions{
 				Mode:        ModeBatch,
 				BatchConfig: defaultWebhookBatchConfig(),
@@ -224,6 +247,9 @@ func validateGroupVersionString(groupVersion string) error {
 	if !knownGroupVersion(gv) {
 		return fmt.Errorf("invalid group version, allowed versions are %q", knownGroupVersions)
 	}
+	if gv != auditv1.SchemeGroupVersion {
+		klog.Warningf("%q is deprecated and will be removed in a future release, use %q instead", gv, auditv1.SchemeGroupVersion)
+	}
 	return nil
 }
 
@@ -252,42 +278,88 @@ func (o *AuditOptions) AddFlags(fs *pflag.FlagSet) {
 	o.WebhookOptions.TruncateOptions.AddFlags(pluginwebhook.PluginName, fs)
 }
 
-func (o *AuditOptions) ApplyTo(c *server.Config) error {
+func (o *AuditOptions) ApplyTo(
+	c *server.Config,
+) error {
 	if o == nil {
 		return nil
 	}
+	if c == nil {
+		return fmt.Errorf("server config must be non-nil")
+	}
 
-	// Apply advanced options.
-	// 1. Apply generic options.
-	if err := o.applyTo(c); err != nil {
+	// 1. Build policy checker
+	checker, err := o.newPolicyChecker()
+	if err != nil {
 		return err
 	}
 
-	// 2. Apply plugin options.
-	if err := o.LogOptions.applyTo(c); err != nil {
-		return err
+	// 2. Build log backend
+	var logBackend audit.Backend
+	if w := o.LogOptions.getWriter(); w != nil {
+		if checker == nil {
+			klog.V(2).Info("No audit policy file provided, no events will be recorded for log backend")
+		} else {
+			logBackend = o.LogOptions.newBackend(w)
+		}
 	}
-	if err := o.WebhookOptions.applyTo(c); err != nil {
+
+	// 3. Build webhook backend
+	var webhookBackend audit.Backend
+	if o.WebhookOptions.enabled() {
+		if checker == nil {
+			klog.V(2).Info("No audit policy file provided, no events will be recorded for webhook backend")
+		} else {
+			if c.EgressSelector != nil {
+				var egressDialer utilnet.DialFunc
+				egressDialer, err = c.EgressSelector.Lookup(egressselector.ControlPlane.AsNetworkContext())
+				if err != nil {
+					return err
+				}
+				webhookBackend, err = o.WebhookOptions.newUntruncatedBackend(egressDialer)
+			} else {
+				webhookBackend, err = o.WebhookOptions.newUntruncatedBackend(nil)
+			}
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	groupVersion, err := schema.ParseGroupVersion(o.WebhookOptions.GroupVersionString)
+	if err != nil {
 		return err
 	}
 
-	if c.AuditBackend != nil && c.AuditPolicyChecker == nil {
-		glog.V(2).Info("No audit policy file provided for AdvancedAuditing, no events will be recorded.")
+	// 4. Apply dynamic options.
+	var dynamicBackend audit.Backend
+	if webhookBackend != nil {
+		// if only webhook is enabled wrap it in the truncate options
+		dynamicBackend = o.WebhookOptions.TruncateOptions.wrapBackend(webhookBackend, groupVersion)
+	}
+
+	// 5. Set the policy checker
+	c.AuditPolicyChecker = checker
+
+	// 6. Join the log backend with the webhooks
+	c.AuditBackend = appendBackend(logBackend, dynamicBackend)
+
+	if c.AuditBackend != nil {
+		klog.V(2).Infof("Using audit backend: %s", c.AuditBackend)
 	}
 	return nil
 }
 
-func (o *AuditOptions) applyTo(c *server.Config) error {
+func (o *AuditOptions) newPolicyChecker() (policy.Checker, error) {
 	if o.PolicyFile == "" {
-		return nil
+		return nil, nil
 	}
 
 	p, err := policy.LoadPolicyFromFile(o.PolicyFile)
 	if err != nil {
-		return fmt.Errorf("loading audit policy file: %v", err)
+		return nil, fmt.Errorf("loading audit policy file: %v", err)
 	}
-	c.AuditPolicyChecker = policy.NewChecker(p)
-	return nil
+	return policy.NewChecker(p), nil
 }
 
 func (o *AuditBatchOptions) AddFlags(pluginName string, fs *pflag.FlagSet) {
@@ -313,9 +385,25 @@ func (o *AuditBatchOptions) AddFlags(pluginName string, fs *pflag.FlagSet) {
 			"moment if ThrottleQPS was not utilized before. Only used in batch mode.")
 }
 
+type ignoreErrorsBackend struct {
+	audit.Backend
+}
+
+func (i *ignoreErrorsBackend) ProcessEvents(ev ...*auditinternal.Event) bool {
+	i.Backend.ProcessEvents(ev...)
+	return true
+}
+
+func (i *ignoreErrorsBackend) String() string {
+	return fmt.Sprintf("ignoreErrors<%s>", i.Backend)
+}
+
 func (o *AuditBatchOptions) wrapBackend(delegate audit.Backend) audit.Backend {
-	if o.Mode == ModeBlocking {
+	if o.Mode == ModeBlockingStrict {
 		return delegate
+	}
+	if o.Mode == ModeBlocking {
+		return &ignoreErrorsBackend{Backend: delegate}
 	}
 	return pluginbuffered.NewBackend(delegate, o.BatchConfig)
 }
@@ -367,6 +455,7 @@ func (o *AuditLogOptions) AddFlags(fs *pflag.FlagSet) {
 			strings.Join(pluginlog.AllowedFormats, ",")+".")
 	fs.StringVar(&o.GroupVersionString, "audit-log-version", o.GroupVersionString,
 		"API group and version used for serializing audit events written to log.")
+	fs.BoolVar(&o.Compress, "audit-log-compress", o.Compress, "If set, the rotated log files will be compressed using gzip.")
 }
 
 func (o *AuditLogOptions) Validate() []error {
@@ -431,20 +520,18 @@ func (o *AuditLogOptions) getWriter() io.Writer {
 			MaxAge:     o.MaxAge,
 			MaxBackups: o.MaxBackups,
 			MaxSize:    o.MaxSize,
+			Compress:   o.Compress,
 		}
 	}
 	return w
 }
 
-func (o *AuditLogOptions) applyTo(c *server.Config) error {
-	if w := o.getWriter(); w != nil {
-		groupVersion, _ := schema.ParseGroupVersion(o.GroupVersionString)
-		log := pluginlog.NewBackend(w, o.Format, groupVersion)
-		log = o.BatchOptions.wrapBackend(log)
-		log = o.TruncateOptions.wrapBackend(log, groupVersion)
-		c.AuditBackend = appendBackend(c.AuditBackend, log)
-	}
-	return nil
+func (o *AuditLogOptions) newBackend(w io.Writer) audit.Backend {
+	groupVersion, _ := schema.ParseGroupVersion(o.GroupVersionString)
+	log := pluginlog.NewBackend(w, o.Format, groupVersion)
+	log = o.BatchOptions.wrapBackend(log)
+	log = o.TruncateOptions.wrapBackend(log, groupVersion)
+	return log
 }
 
 func (o *AuditWebhookOptions) AddFlags(fs *pflag.FlagSet) {
@@ -483,20 +570,16 @@ func (o *AuditWebhookOptions) enabled() bool {
 	return o != nil && o.ConfigFile != ""
 }
 
-func (o *AuditWebhookOptions) applyTo(c *server.Config) error {
-	if !o.enabled() {
-		return nil
-	}
-
+// newUntruncatedBackend returns a webhook backend without the truncate options applied
+// this is done so that the same trucate backend can wrap both the webhook and dynamic backends
+func (o *AuditWebhookOptions) newUntruncatedBackend(customDial utilnet.DialFunc) (audit.Backend, error) {
 	groupVersion, _ := schema.ParseGroupVersion(o.GroupVersionString)
-	webhook, err := pluginwebhook.NewBackend(o.ConfigFile, groupVersion, o.InitialBackoff)
+	webhook, err := pluginwebhook.NewBackend(o.ConfigFile, groupVersion, webhook.DefaultRetryBackoffWithInitialDelay(o.InitialBackoff), customDial)
 	if err != nil {
-		return fmt.Errorf("initializing audit webhook: %v", err)
+		return nil, fmt.Errorf("initializing audit webhook: %v", err)
 	}
 	webhook = o.BatchOptions.wrapBackend(webhook)
-	webhook = o.TruncateOptions.wrapBackend(webhook, groupVersion)
-	c.AuditBackend = appendBackend(c.AuditBackend, webhook)
-	return nil
+	return webhook, nil
 }
 
 // defaultWebhookBatchConfig returns the default BatchConfig used by the Webhook backend.

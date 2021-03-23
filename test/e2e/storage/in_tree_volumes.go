@@ -17,19 +17,15 @@ limitations under the License.
 package storage
 
 import (
-	"fmt"
-
-	. "github.com/onsi/ginkgo"
-	"k8s.io/api/core/v1"
-	"k8s.io/kubernetes/test/e2e/framework"
+	"github.com/onsi/ginkgo"
 	"k8s.io/kubernetes/test/e2e/storage/drivers"
-	"k8s.io/kubernetes/test/e2e/storage/testpatterns"
+	storageframework "k8s.io/kubernetes/test/e2e/storage/framework"
 	"k8s.io/kubernetes/test/e2e/storage/testsuites"
 	"k8s.io/kubernetes/test/e2e/storage/utils"
 )
 
 // List of testDrivers to be executed in below loop
-var testDrivers = []func() drivers.TestDriver{
+var testDrivers = []func() storageframework.TestDriver{
 	drivers.InitNFSDriver,
 	drivers.InitGlusterFSDriver,
 	drivers.InitISCSIDriver,
@@ -40,58 +36,27 @@ var testDrivers = []func() drivers.TestDriver{
 	drivers.InitEmptydirDriver,
 	drivers.InitCinderDriver,
 	drivers.InitGcePdDriver,
+	drivers.InitWindowsGcePdDriver,
 	drivers.InitVSphereDriver,
-	drivers.InitAzureDriver,
+	drivers.InitAzureDiskDriver,
 	drivers.InitAwsDriver,
-}
-
-// List of testSuites to be executed in below loop
-var testSuites = []func() testsuites.TestSuite{
-	testsuites.InitVolumesTestSuite,
-	testsuites.InitVolumeIOTestSuite,
-	testsuites.InitVolumeModeTestSuite,
-	testsuites.InitSubPathTestSuite,
-	testsuites.InitProvisioningTestSuite,
-}
-
-func intreeTunePattern(patterns []testpatterns.TestPattern) []testpatterns.TestPattern {
-	return patterns
+	drivers.InitLocalDriverWithVolumeType(utils.LocalVolumeDirectory),
+	drivers.InitLocalDriverWithVolumeType(utils.LocalVolumeDirectoryLink),
+	drivers.InitLocalDriverWithVolumeType(utils.LocalVolumeDirectoryBindMounted),
+	drivers.InitLocalDriverWithVolumeType(utils.LocalVolumeDirectoryLinkBindMounted),
+	drivers.InitLocalDriverWithVolumeType(utils.LocalVolumeTmpfs),
+	drivers.InitLocalDriverWithVolumeType(utils.LocalVolumeBlock),
+	drivers.InitLocalDriverWithVolumeType(utils.LocalVolumeBlockFS),
+	drivers.InitLocalDriverWithVolumeType(utils.LocalVolumeGCELocalSSD),
 }
 
 // This executes testSuites for in-tree volumes.
 var _ = utils.SIGDescribe("In-tree Volumes", func() {
-	f := framework.NewDefaultFramework("volumes")
-
-	var (
-		ns     *v1.Namespace
-		config framework.VolumeTestConfig
-	)
-
-	BeforeEach(func() {
-		ns = f.Namespace
-		config = framework.VolumeTestConfig{
-			Namespace: ns.Name,
-			Prefix:    "volume",
-		}
-	})
-
 	for _, initDriver := range testDrivers {
 		curDriver := initDriver()
-		Context(fmt.Sprintf(drivers.GetDriverNameWithFeatureTags(curDriver)), func() {
-			driver := curDriver
 
-			BeforeEach(func() {
-				// setupDriver
-				drivers.SetCommonDriverParameters(driver, f, config)
-				driver.CreateDriver()
-			})
-
-			AfterEach(func() {
-				// Cleanup driver
-				driver.CleanupDriver()
-			})
-
-			testsuites.RunTestSuite(f, config, driver, testSuites, intreeTunePattern)
+		ginkgo.Context(storageframework.GetDriverNameWithFeatureTags(curDriver), func() {
+			storageframework.DefineTestSuites(curDriver, testsuites.BaseSuites)
 		})
 	}
 })

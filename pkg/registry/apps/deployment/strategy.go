@@ -34,6 +34,7 @@ import (
 	"k8s.io/kubernetes/pkg/api/pod"
 	"k8s.io/kubernetes/pkg/apis/apps"
 	"k8s.io/kubernetes/pkg/apis/apps/validation"
+	"sigs.k8s.io/structured-merge-diff/v4/fieldpath"
 )
 
 // deploymentStrategy implements behavior for Deployments.
@@ -46,24 +47,37 @@ type deploymentStrategy struct {
 // objects via the REST API.
 var Strategy = deploymentStrategy{legacyscheme.Scheme, names.SimpleNameGenerator}
 
-// DefaultGarbageCollectionPolicy returns OrphanDependents by default. For apps/v1, returns DeleteDependents.
+// DefaultGarbageCollectionPolicy returns OrphanDependents for extensions/v1beta1, apps/v1beta1, and apps/v1beta2 for backwards compatibility,
+// and DeleteDependents for all other versions.
 func (deploymentStrategy) DefaultGarbageCollectionPolicy(ctx context.Context) rest.GarbageCollectionPolicy {
+	var groupVersion schema.GroupVersion
 	if requestInfo, found := genericapirequest.RequestInfoFrom(ctx); found {
-		groupVersion := schema.GroupVersion{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion}
-		switch groupVersion {
-		case extensionsv1beta1.SchemeGroupVersion, appsv1beta1.SchemeGroupVersion, appsv1beta2.SchemeGroupVersion:
-			// for back compatibility
-			return rest.OrphanDependents
-		default:
-			return rest.DeleteDependents
-		}
+		groupVersion = schema.GroupVersion{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion}
 	}
-	return rest.OrphanDependents
+	switch groupVersion {
+	case extensionsv1beta1.SchemeGroupVersion, appsv1beta1.SchemeGroupVersion, appsv1beta2.SchemeGroupVersion:
+		// for back compatibility
+		return rest.OrphanDependents
+	default:
+		return rest.DeleteDependents
+	}
 }
 
 // NamespaceScoped is true for deployment.
 func (deploymentStrategy) NamespaceScoped() bool {
 	return true
+}
+
+// GetResetFields returns the set of fields that get reset by the strategy
+// and should not be modified by the user.
+func (deploymentStrategy) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	fields := map[fieldpath.APIVersion]*fieldpath.Set{
+		"apps/v1": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("status"),
+		),
+	}
+
+	return fields
 }
 
 // PrepareForCreate clears fields that are not allowed to be set by end users on creation.
@@ -72,13 +86,14 @@ func (deploymentStrategy) PrepareForCreate(ctx context.Context, obj runtime.Obje
 	deployment.Status = apps.DeploymentStatus{}
 	deployment.Generation = 1
 
-	pod.DropDisabledAlphaFields(&deployment.Spec.Template.Spec)
+	pod.DropDisabledTemplateFields(&deployment.Spec.Template, nil)
 }
 
 // Validate validates a new deployment.
 func (deploymentStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
 	deployment := obj.(*apps.Deployment)
-	return validation.ValidateDeployment(deployment)
+	opts := pod.GetValidationOptionsFromPodTemplate(&deployment.Spec.Template, nil)
+	return validation.ValidateDeployment(deployment, opts)
 }
 
 // Canonicalize normalizes the object after validation.
@@ -96,8 +111,7 @@ func (deploymentStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime
 	oldDeployment := old.(*apps.Deployment)
 	newDeployment.Status = oldDeployment.Status
 
-	pod.DropDisabledAlphaFields(&newDeployment.Spec.Template.Spec)
-	pod.DropDisabledAlphaFields(&oldDeployment.Spec.Template.Spec)
+	pod.DropDisabledTemplateFields(&newDeployment.Spec.Template, &oldDeployment.Spec.Template)
 
 	// Spec updates bump the generation so that we can distinguish between
 	// scaling events and template changes, annotation updates bump the generation
@@ -112,7 +126,9 @@ func (deploymentStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime
 func (deploymentStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
 	newDeployment := obj.(*apps.Deployment)
 	oldDeployment := old.(*apps.Deployment)
-	allErrs := validation.ValidateDeploymentUpdate(newDeployment, oldDeployment)
+
+	opts := pod.GetValidationOptionsFromPodTemplate(&newDeployment.Spec.Template, &oldDeployment.Spec.Template)
+	allErrs := validation.ValidateDeploymentUpdate(newDeployment, oldDeployment, opts)
 
 	// Update is not allowed to set Spec.Selector for all groups/versions except extensions/v1beta1.
 	// If RequestInfo is nil, it is better to revert to old behavior (i.e. allow update to set Spec.Selector)
@@ -141,7 +157,19 @@ type deploymentStatusStrategy struct {
 	deploymentStrategy
 }
 
+// StatusStrategy is the default logic invoked when updating object status.
 var StatusStrategy = deploymentStatusStrategy{Strategy}
+
+// GetResetFields returns the set of fields that get reset by the strategy
+// and should not be modified by the user.
+func (deploymentStatusStrategy) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	return map[fieldpath.APIVersion]*fieldpath.Set{
+		"apps/v1": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("spec"),
+			fieldpath.MakePathOrDie("metadata", "labels"),
+		),
+	}
+}
 
 // PrepareForUpdate clears fields that are not allowed to be set by end users on update of status
 func (deploymentStatusStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {

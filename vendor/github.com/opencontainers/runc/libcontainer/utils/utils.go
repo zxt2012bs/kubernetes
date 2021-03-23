@@ -1,8 +1,7 @@
 package utils
 
 import (
-	"crypto/rand"
-	"encoding/hex"
+	"encoding/binary"
 	"encoding/json"
 	"io"
 	"os"
@@ -17,17 +16,18 @@ const (
 	exitSignalOffset = 128
 )
 
-// GenerateRandomName returns a new name joined with a prefix.  This size
-// specified is used to truncate the randomly generated value
-func GenerateRandomName(prefix string, size int) (string, error) {
-	id := make([]byte, 32)
-	if _, err := io.ReadFull(rand.Reader, id); err != nil {
-		return "", err
+// NativeEndian is the native byte order of the host system.
+var NativeEndian binary.ByteOrder
+
+func init() {
+	// Copied from <golang.org/x/net/internal/socket/sys.go>.
+	i := uint32(1)
+	b := (*[4]byte)(unsafe.Pointer(&i))
+	if b[0] == 1 {
+		NativeEndian = binary.LittleEndian
+	} else {
+		NativeEndian = binary.BigEndian
 	}
-	if size > 64 {
-		size = 64
-	}
-	return prefix + hex.EncodeToString(id)[:size], nil
 }
 
 // ResolveRootfs ensures that the current working directory is
@@ -120,8 +120,4 @@ func Annotations(labels []string) (bundle string, userAnnotations map[string]str
 		}
 	}
 	return
-}
-
-func GetIntSize() int {
-	return int(unsafe.Sizeof(1))
 }

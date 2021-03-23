@@ -1,26 +1,32 @@
 kind: DaemonSet
 apiVersion: apps/v1
 metadata:
-  name: csi-gce-node
+  name: csi-gce-pd-node
 spec:
   selector:
     matchLabels:
-      app: csi-gce-driver
-  serviceName: csi-gce
+      app: gcp-compute-persistent-disk-csi-driver
   template:
     metadata:
       labels:
-        app: csi-gce-driver
+        app: gcp-compute-persistent-disk-csi-driver
     spec:
-      serviceAccountName: csi-driver-registrar
+      # Host network must be used for interaction with Workload Identity in GKE
+      # since it replaces GCE Metadata Server with GKE Metadata Server. Remove
+      # this requirement when issue is resolved and before any exposure of
+      # metrics ports.
+      hostNetwork: true
       containers:
         - name: csi-driver-registrar
-          imagePullPolicy: Always
-          image: gcr.io/gke-release/csi-driver-registrar:v0.4.1-gke.0
+          image: k8s.gcr.io/sig-storage/csi-node-driver-registrar:v1.3.0
           args:
             - "--v=5"
             - "--csi-address=/csi/csi.sock"
-            - "--kubelet-registration-path=/var/lib/kubelet/plugins/com.google.csi.gcepd/csi.sock"
+            - "--kubelet-registration-path=/var/lib/kubelet/plugins/pd.csi.storage.gke.io/csi.sock"
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "rm -rf /registration/pd.csi.storage.gke.io /registration/pd.csi.storage.gke.io-reg.sock"]
           env:
             - name: KUBE_NODE_NAME
               valueFrom:
@@ -31,14 +37,13 @@ spec:
               mountPath: /csi
             - name: registration-dir
               mountPath: /registration
-        - name: gce-driver
+        - name: gce-pd-driver
           securityContext:
             privileged: true
-          imagePullPolicy: Always
-          image: gcr.io/gke-release/gcp-compute-persistent-disk-csi-driver:v0.2.0-gke.0
+          image: gcr.io/gke-release/gcp-compute-persistent-disk-csi-driver:v0.7.0-gke.0
           args:
             - "--v=5"
-            - "--endpoint=unix:///csi/csi.sock"
+            - "--endpoint=unix:/csi/csi.sock"
           volumeMounts:
             - name: kubelet-dir
               mountPath: /var/lib/kubelet
@@ -47,7 +52,8 @@ spec:
               mountPath: /csi
             - name: device-dir
               mountPath: /dev
-            # The following mounts are required to trigger host udevadm from container
+            # The following mounts are required to trigger host udevadm from
+            # container
             - name: udev-rules-etc
               mountPath: /etc/udev
             - name: udev-rules-lib
@@ -59,7 +65,7 @@ spec:
       volumes:
         - name: registration-dir
           hostPath:
-            path: /var/lib/kubelet/plugins/
+            path: /var/lib/kubelet/plugins_registry/
             type: Directory
         - name: kubelet-dir
           hostPath:
@@ -67,13 +73,14 @@ spec:
             type: Directory
         - name: plugin-dir
           hostPath:
-            path: /var/lib/kubelet/plugins/com.google.csi.gcepd/
+            path: /var/lib/kubelet/plugins/pd.csi.storage.gke.io/
             type: DirectoryOrCreate
         - name: device-dir
           hostPath:
             path: /dev
             type: Directory
-        # The following mounts are required to trigger host udevadm from container
+        # The following mounts are required to trigger host udevadm from
+        # container
         - name: udev-rules-etc
           hostPath:
             path: /etc/udev
@@ -90,4 +97,10 @@ spec:
           hostPath:
             path: /sys
             type: Directory
-
+      # https://kubernetes.io/docs/concepts/configuration/taint-and-toleration/
+      # See "special case". This will tolerate everything. Node component should
+      # be scheduled on all nodes.
+      tolerations:
+      - operator: Exists
+      nodeSelector:
+        kubernetes.io/os: linux

@@ -18,8 +18,6 @@ package persistentvolume
 
 import (
 	corev1 "k8s.io/api/core/v1"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	"k8s.io/kubernetes/pkg/features"
 )
 
 func getClaimRefNamespace(pv *corev1.PersistentVolume) string {
@@ -32,10 +30,22 @@ func getClaimRefNamespace(pv *corev1.PersistentVolume) string {
 // Visitor is called with each object's namespace and name, and returns true if visiting should continue
 type Visitor func(namespace, name string, kubeletVisible bool) (shouldContinue bool)
 
+func skipEmptyNames(visitor Visitor) Visitor {
+	return func(namespace, name string, kubeletVisible bool) bool {
+		if len(name) == 0 {
+			// continue visiting
+			return true
+		}
+		// delegate to visitor
+		return visitor(namespace, name, kubeletVisible)
+	}
+}
+
 // VisitPVSecretNames invokes the visitor function with the name of every secret
 // referenced by the PV spec. If visitor returns false, visiting is short-circuited.
 // Returns true if visiting completed, false if visiting was short-circuited.
 func VisitPVSecretNames(pv *corev1.PersistentVolume, visitor Visitor) bool {
+	visitor = skipEmptyNames(visitor)
 	source := &pv.Spec.PersistentVolumeSource
 	switch {
 	case source.AzureFile != nil:
@@ -121,6 +131,12 @@ func VisitPVSecretNames(pv *corev1.PersistentVolume, visitor Visitor) bool {
 				return false
 			}
 		}
+		if source.CSI.ControllerExpandSecretRef != nil {
+			if !visitor(source.CSI.ControllerExpandSecretRef.Namespace, source.CSI.ControllerExpandSecretRef.Name, false /* kubeletVisible */) {
+				return false
+			}
+		}
+
 		if source.CSI.NodePublishSecretRef != nil {
 			if !visitor(source.CSI.NodePublishSecretRef.Namespace, source.CSI.NodePublishSecretRef.Name, true /* kubeletVisible */) {
 				return false
@@ -133,12 +149,4 @@ func VisitPVSecretNames(pv *corev1.PersistentVolume, visitor Visitor) bool {
 		}
 	}
 	return true
-}
-
-// DropDisabledAlphaFields removes disabled fields from the pv spec.
-// This should be called from PrepareForCreate/PrepareForUpdate for all resources containing a pv spec.
-func DropDisabledAlphaFields(pvSpec *corev1.PersistentVolumeSpec) {
-	if !utilfeature.DefaultFeatureGate.Enabled(features.BlockVolume) {
-		pvSpec.VolumeMode = nil
-	}
 }

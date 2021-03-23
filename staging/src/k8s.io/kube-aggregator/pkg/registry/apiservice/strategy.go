@@ -25,11 +25,13 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/apiserver/pkg/registry/generic"
+	"k8s.io/apiserver/pkg/registry/rest"
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/names"
 
 	"k8s.io/kube-aggregator/pkg/apis/apiregistration"
 	"k8s.io/kube-aggregator/pkg/apis/apiregistration/validation"
+	"sigs.k8s.io/structured-merge-diff/v4/fieldpath"
 )
 
 type apiServerStrategy struct {
@@ -37,12 +39,30 @@ type apiServerStrategy struct {
 	names.NameGenerator
 }
 
-func NewStrategy(typer runtime.ObjectTyper) apiServerStrategy {
+// apiServerStrategy must implement rest.RESTCreateUpdateStrategy
+var _ rest.RESTCreateUpdateStrategy = apiServerStrategy{}
+var Strategy = apiServerStrategy{}
+
+// NewStrategy creates a new apiServerStrategy.
+func NewStrategy(typer runtime.ObjectTyper) rest.CreateUpdateResetFieldsStrategy {
 	return apiServerStrategy{typer, names.SimpleNameGenerator}
 }
 
 func (apiServerStrategy) NamespaceScoped() bool {
 	return false
+}
+
+func (apiServerStrategy) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	fields := map[fieldpath.APIVersion]*fieldpath.Set{
+		"apiregistration.k8s.io/v1": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("status"),
+		),
+		"apiregistration.k8s.io/v1beta1": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("status"),
+		),
+	}
+
+	return fields
 }
 
 func (apiServerStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
@@ -85,12 +105,28 @@ type apiServerStatusStrategy struct {
 	names.NameGenerator
 }
 
-func NewStatusStrategy(typer runtime.ObjectTyper) apiServerStatusStrategy {
+// NewStatusStrategy creates a new apiServerStatusStrategy.
+func NewStatusStrategy(typer runtime.ObjectTyper) rest.UpdateResetFieldsStrategy {
 	return apiServerStatusStrategy{typer, names.SimpleNameGenerator}
 }
 
 func (apiServerStatusStrategy) NamespaceScoped() bool {
 	return false
+}
+
+func (apiServerStatusStrategy) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	fields := map[fieldpath.APIVersion]*fieldpath.Set{
+		"apiregistration.k8s.io/v1": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("spec"),
+			fieldpath.MakePathOrDie("metadata"),
+		),
+		"apiregistration.k8s.io/v1beta1": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("spec"),
+			fieldpath.MakePathOrDie("metadata"),
+		),
+	}
+
+	return fields
 }
 
 func (apiServerStatusStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
@@ -111,19 +147,22 @@ func (apiServerStatusStrategy) AllowUnconditionalUpdate() bool {
 	return false
 }
 
+// Canonicalize normalizes the object after validation.
 func (apiServerStatusStrategy) Canonicalize(obj runtime.Object) {
 }
 
+// ValidateUpdate validates an update of apiServerStatusStrategy.
 func (apiServerStatusStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
 	return validation.ValidateAPIServiceStatusUpdate(obj.(*apiregistration.APIService), old.(*apiregistration.APIService))
 }
 
-func GetAttrs(obj runtime.Object) (labels.Set, fields.Set, bool, error) {
+// GetAttrs returns the labels and fields of an API server for filtering purposes.
+func GetAttrs(obj runtime.Object) (labels.Set, fields.Set, error) {
 	apiserver, ok := obj.(*apiregistration.APIService)
 	if !ok {
-		return nil, nil, false, fmt.Errorf("given object is not a APIService.")
+		return nil, nil, fmt.Errorf("given object is not a APIService")
 	}
-	return labels.Set(apiserver.ObjectMeta.Labels), APIServiceToSelectableFields(apiserver), apiserver.Initializers != nil, nil
+	return labels.Set(apiserver.ObjectMeta.Labels), ToSelectableFields(apiserver), nil
 }
 
 // MatchAPIService is the filter used by the generic etcd backend to watch events
@@ -136,7 +175,7 @@ func MatchAPIService(label labels.Selector, field fields.Selector) storage.Selec
 	}
 }
 
-// APIServiceToSelectableFields returns a field set that represents the object.
-func APIServiceToSelectableFields(obj *apiregistration.APIService) fields.Set {
+// ToSelectableFields returns a field set that represents the object.
+func ToSelectableFields(obj *apiregistration.APIService) fields.Set {
 	return generic.ObjectMetaFieldsSet(&obj.ObjectMeta, true)
 }

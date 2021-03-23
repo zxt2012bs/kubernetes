@@ -41,6 +41,7 @@ import (
 	"k8s.io/kubernetes/pkg/api/pod"
 	"k8s.io/kubernetes/pkg/apis/apps"
 	"k8s.io/kubernetes/pkg/apis/apps/validation"
+	"sigs.k8s.io/structured-merge-diff/v4/fieldpath"
 )
 
 // rsStrategy implements verification logic for ReplicaSets.
@@ -52,24 +53,37 @@ type rsStrategy struct {
 // Strategy is the default logic that applies when creating and updating ReplicaSet objects.
 var Strategy = rsStrategy{legacyscheme.Scheme, names.SimpleNameGenerator}
 
-// DefaultGarbageCollectionPolicy returns OrphanDependents by default. For apps/v1, returns DeleteDependents.
+// DefaultGarbageCollectionPolicy returns OrphanDependents for extensions/v1beta1 and apps/v1beta2 for backwards compatibility,
+// and DeleteDependents for all other versions.
 func (rsStrategy) DefaultGarbageCollectionPolicy(ctx context.Context) rest.GarbageCollectionPolicy {
+	var groupVersion schema.GroupVersion
 	if requestInfo, found := genericapirequest.RequestInfoFrom(ctx); found {
-		groupVersion := schema.GroupVersion{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion}
-		switch groupVersion {
-		case extensionsv1beta1.SchemeGroupVersion, appsv1beta2.SchemeGroupVersion:
-			// for back compatibility
-			return rest.OrphanDependents
-		default:
-			return rest.DeleteDependents
-		}
+		groupVersion = schema.GroupVersion{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion}
 	}
-	return rest.OrphanDependents
+	switch groupVersion {
+	case extensionsv1beta1.SchemeGroupVersion, appsv1beta2.SchemeGroupVersion:
+		// for back compatibility
+		return rest.OrphanDependents
+	default:
+		return rest.DeleteDependents
+	}
 }
 
 // NamespaceScoped returns true because all ReplicaSets need to be within a namespace.
 func (rsStrategy) NamespaceScoped() bool {
 	return true
+}
+
+// GetResetFields returns the set of fields that get reset by the strategy
+// and should not be modified by the user.
+func (rsStrategy) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	fields := map[fieldpath.APIVersion]*fieldpath.Set{
+		"apps/v1": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("status"),
+		),
+	}
+
+	return fields
 }
 
 // PrepareForCreate clears the status of a ReplicaSet before creation.
@@ -79,7 +93,7 @@ func (rsStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
 
 	rs.Generation = 1
 
-	pod.DropDisabledAlphaFields(&rs.Spec.Template.Spec)
+	pod.DropDisabledTemplateFields(&rs.Spec.Template, nil)
 }
 
 // PrepareForUpdate clears fields that are not allowed to be set by end users on update.
@@ -89,8 +103,7 @@ func (rsStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object)
 	// update is not allowed to set status
 	newRS.Status = oldRS.Status
 
-	pod.DropDisabledAlphaFields(&newRS.Spec.Template.Spec)
-	pod.DropDisabledAlphaFields(&oldRS.Spec.Template.Spec)
+	pod.DropDisabledTemplateFields(&newRS.Spec.Template, &oldRS.Spec.Template)
 
 	// Any changes to the spec increment the generation number, any changes to the
 	// status should reflect the generation number of the corresponding object. We push
@@ -108,7 +121,8 @@ func (rsStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object)
 // Validate validates a new ReplicaSet.
 func (rsStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
 	rs := obj.(*apps.ReplicaSet)
-	return validation.ValidateReplicaSet(rs)
+	opts := pod.GetValidationOptionsFromPodTemplate(&rs.Spec.Template, nil)
+	return validation.ValidateReplicaSet(rs, opts)
 }
 
 // Canonicalize normalizes the object after validation.
@@ -125,8 +139,10 @@ func (rsStrategy) AllowCreateOnUpdate() bool {
 func (rsStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
 	newReplicaSet := obj.(*apps.ReplicaSet)
 	oldReplicaSet := old.(*apps.ReplicaSet)
-	allErrs := validation.ValidateReplicaSet(obj.(*apps.ReplicaSet))
-	allErrs = append(allErrs, validation.ValidateReplicaSetUpdate(newReplicaSet, oldReplicaSet)...)
+
+	opts := pod.GetValidationOptionsFromPodTemplate(&newReplicaSet.Spec.Template, &oldReplicaSet.Spec.Template)
+	allErrs := validation.ValidateReplicaSet(obj.(*apps.ReplicaSet), opts)
+	allErrs = append(allErrs, validation.ValidateReplicaSetUpdate(newReplicaSet, oldReplicaSet, opts)...)
 
 	// Update is not allowed to set Spec.Selector for all groups/versions except extensions/v1beta1.
 	// If RequestInfo is nil, it is better to revert to old behavior (i.e. allow update to set Spec.Selector)
@@ -150,8 +166,8 @@ func (rsStrategy) AllowUnconditionalUpdate() bool {
 	return true
 }
 
-// ReplicaSetToSelectableFields returns a field set that represents the object.
-func ReplicaSetToSelectableFields(rs *apps.ReplicaSet) fields.Set {
+// ToSelectableFields returns a field set that represents the object.
+func ToSelectableFields(rs *apps.ReplicaSet) fields.Set {
 	objectMetaFieldsSet := generic.ObjectMetaFieldsSet(&rs.ObjectMeta, true)
 	rsSpecificFieldsSet := fields.Set{
 		"status.replicas": strconv.Itoa(int(rs.Status.Replicas)),
@@ -160,12 +176,12 @@ func ReplicaSetToSelectableFields(rs *apps.ReplicaSet) fields.Set {
 }
 
 // GetAttrs returns labels and fields of a given object for filtering purposes.
-func GetAttrs(obj runtime.Object) (labels.Set, fields.Set, bool, error) {
+func GetAttrs(obj runtime.Object) (labels.Set, fields.Set, error) {
 	rs, ok := obj.(*apps.ReplicaSet)
 	if !ok {
-		return nil, nil, false, fmt.Errorf("given object is not a ReplicaSet.")
+		return nil, nil, fmt.Errorf("given object is not a ReplicaSet")
 	}
-	return labels.Set(rs.ObjectMeta.Labels), ReplicaSetToSelectableFields(rs), rs.Initializers != nil, nil
+	return labels.Set(rs.ObjectMeta.Labels), ToSelectableFields(rs), nil
 }
 
 // MatchReplicaSet is the filter used by the generic etcd backend to route
@@ -183,7 +199,18 @@ type rsStatusStrategy struct {
 	rsStrategy
 }
 
+// StatusStrategy is the default logic invoked when updating object status.
 var StatusStrategy = rsStatusStrategy{Strategy}
+
+// GetResetFields returns the set of fields that get reset by the strategy
+// and should not be modified by the user.
+func (rsStatusStrategy) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	return map[fieldpath.APIVersion]*fieldpath.Set{
+		"apps/v1": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("spec"),
+		),
+	}
+}
 
 func (rsStatusStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
 	newRS := obj.(*apps.ReplicaSet)

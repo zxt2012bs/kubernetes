@@ -1,15 +1,16 @@
+# See the OWNERS docs at https://go.k8s.io/owners
+
 approvers:
 - pmorie
 - saad-ali
 - thockin
-- matchstick
 - SandeepPissay
 - divyenpatel
 - BaluDontu
+emeritus_approvers:
+- matchstick
 - abrarshivani
 reviewers:
-- abithap
-- abrarshivani
 - saad-ali
 - justinsb
 - jsafrane

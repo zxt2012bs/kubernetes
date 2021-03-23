@@ -17,33 +17,32 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-export KUBE_ROOT=$(dirname "${BASH_SOURCE}")/..
-source "${KUBE_ROOT}/hack/lib/init.sh"
+KUBE_ROOT=$(dirname "${BASH_SOURCE[0]}")/..
 
-# Remove generated files prior to running kazel.
-# TODO(spxtr): Remove this line once Bazel is the only way to build.
-rm -f "${KUBE_ROOT}/pkg/generated/openapi/zz_generated.openapi.go"
+# delete all bazel related files not in vendor/
+find "${KUBE_ROOT}" \
+  \( \
+    -name BUILD \
+    -o -name BUILD.bazel \
+    -o -name '*.bzl' \
+  \) \
+  -not \
+  \( \
+    -path "${KUBE_ROOT}"'/vendor*' \
+  \) \
+  -delete
 
-# Ensure that we find the binaries we build before anything else.
-export GOBIN="${KUBE_OUTPUT_BINPATH}"
-PATH="${GOBIN}:${PATH}"
+# remove additional one-off bazel related files
+# NOTE: most of these will be pairs of symlinked location in "${KUBE_ROOT}/"
+# and the actual location in "${KUBE_ROOT}/build/root/"
+rm -f \
+  "${KUBE_ROOT}/build/root/BUILD.root" \
+  "${KUBE_ROOT}/WORKSPACE" \
+  "${KUBE_ROOT}/build/root/WORKSPACE" \
+  "${KUBE_ROOT}/.bazelrc" \
+  "${KUBE_ROOT}/build/root/.bazelrc" \
+  "${KUBE_ROOT}/.bazelversion" \
+  "${KUBE_ROOT}/build/root/.bazelversion" \
+  "${KUBE_ROOT}/.kazelcfg.json" \
+  "${KUBE_ROOT}/build/root/.kazelcfg.json"
 
-# Install tools we need, but only from vendor/...
-go install k8s.io/kubernetes/vendor/github.com/bazelbuild/bazel-gazelle/cmd/gazelle
-go install k8s.io/kubernetes/vendor/github.com/kubernetes/repo-infra/kazel
-
-touch "${KUBE_ROOT}/vendor/BUILD"
-# Ensure that we use the correct importmap for all vendored dependencies.
-# Probably not necessary in gazelle 0.13+
-# (https://github.com/bazelbuild/bazel-gazelle/pull/207).
-if ! grep -q "# gazelle:importmap_prefix" "${KUBE_ROOT}/vendor/BUILD"; then
-  echo "# gazelle:importmap_prefix k8s.io/kubernetes/vendor" >> "${KUBE_ROOT}/vendor/BUILD"
-fi
-
-gazelle fix \
-    -external=vendored \
-    -mode=fix \
-    -repo_root "${KUBE_ROOT}" \
-    "${KUBE_ROOT}"
-
-kazel

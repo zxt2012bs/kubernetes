@@ -1,3 +1,5 @@
+// +build !dockerless
+
 /*
 Copyright 2017 The Kubernetes Authors.
 
@@ -20,14 +22,17 @@ import (
 	"sync"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
+	"k8s.io/component-base/metrics"
+	"k8s.io/component-base/metrics/legacyregistry"
 )
 
 const (
 	// NetworkPluginOperationsKey is the key for operation count metrics.
-	NetworkPluginOperationsKey = "network_plugin_operations"
+	NetworkPluginOperationsKey = "network_plugin_operations_total"
 	// NetworkPluginOperationsLatencyKey is the key for the operation latency metrics.
-	NetworkPluginOperationsLatencyKey = "network_plugin_operations_latency_microseconds"
+	NetworkPluginOperationsLatencyKey = "network_plugin_operations_duration_seconds"
+	// NetworkPluginOperationsErrorsKey is the key for the operations error metrics.
+	NetworkPluginOperationsErrorsKey = "network_plugin_operations_errors_total"
 
 	// Keep the "kubelet" subsystem for backward compatibility.
 	kubeletSubsystem = "kubelet"
@@ -36,11 +41,35 @@ const (
 var (
 	// NetworkPluginOperationsLatency collects operation latency numbers by operation
 	// type.
-	NetworkPluginOperationsLatency = prometheus.NewSummaryVec(
-		prometheus.SummaryOpts{
-			Subsystem: kubeletSubsystem,
-			Name:      NetworkPluginOperationsLatencyKey,
-			Help:      "Latency in microseconds of network plugin operations. Broken down by operation type.",
+	NetworkPluginOperationsLatency = metrics.NewHistogramVec(
+		&metrics.HistogramOpts{
+			Subsystem:      kubeletSubsystem,
+			Name:           NetworkPluginOperationsLatencyKey,
+			Help:           "Latency in seconds of network plugin operations. Broken down by operation type.",
+			Buckets:        metrics.DefBuckets,
+			StabilityLevel: metrics.ALPHA,
+		},
+		[]string{"operation_type"},
+	)
+
+	// NetworkPluginOperations collects operation counts by operation type.
+	NetworkPluginOperations = metrics.NewCounterVec(
+		&metrics.CounterOpts{
+			Subsystem:      kubeletSubsystem,
+			Name:           NetworkPluginOperationsKey,
+			Help:           "Cumulative number of network plugin operations by operation type.",
+			StabilityLevel: metrics.ALPHA,
+		},
+		[]string{"operation_type"},
+	)
+
+	// NetworkPluginOperationsErrors collects operation errors by operation type.
+	NetworkPluginOperationsErrors = metrics.NewCounterVec(
+		&metrics.CounterOpts{
+			Subsystem:      kubeletSubsystem,
+			Name:           NetworkPluginOperationsErrorsKey,
+			Help:           "Cumulative number of network plugin operation errors by operation type.",
+			StabilityLevel: metrics.ALPHA,
 		},
 		[]string{"operation_type"},
 	)
@@ -51,11 +80,13 @@ var registerMetrics sync.Once
 // Register all metrics.
 func Register() {
 	registerMetrics.Do(func() {
-		prometheus.MustRegister(NetworkPluginOperationsLatency)
+		legacyregistry.MustRegister(NetworkPluginOperationsLatency)
+		legacyregistry.MustRegister(NetworkPluginOperations)
+		legacyregistry.MustRegister(NetworkPluginOperationsErrors)
 	})
 }
 
-// SinceInMicroseconds gets the time since the specified start in microseconds.
-func SinceInMicroseconds(start time.Time) float64 {
-	return float64(time.Since(start).Nanoseconds() / time.Microsecond.Nanoseconds())
+// SinceInSeconds gets the time since the specified start in seconds.
+func SinceInSeconds(start time.Time) float64 {
+	return time.Since(start).Seconds()
 }

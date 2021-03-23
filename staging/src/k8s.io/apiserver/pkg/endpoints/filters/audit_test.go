@@ -18,6 +18,7 @@ package filters
 
 import (
 	"bufio"
+	"context"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -26,7 +27,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pborman/uuid"
+	"github.com/google/uuid"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -42,13 +43,14 @@ type fakeAuditSink struct {
 	events []*auditinternal.Event
 }
 
-func (s *fakeAuditSink) ProcessEvents(evs ...*auditinternal.Event) {
+func (s *fakeAuditSink) ProcessEvents(evs ...*auditinternal.Event) bool {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 	for _, e := range evs {
 		event := e.DeepCopy()
 		s.events = append(s.events, event)
 	}
+	return true
 }
 
 func (s *fakeAuditSink) Events() []*auditinternal.Event {
@@ -91,14 +93,14 @@ func (*fancyResponseWriter) Flush() {}
 func (*fancyResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) { return nil, nil, nil }
 
 func TestConstructResponseWriter(t *testing.T) {
-	actual := decorateResponseWriter(&simpleResponseWriter{}, nil, nil, nil)
+	actual := decorateResponseWriter(context.Background(), &simpleResponseWriter{}, nil, nil, nil)
 	switch v := actual.(type) {
 	case *auditResponseWriter:
 	default:
 		t.Errorf("Expected auditResponseWriter, got %v", reflect.TypeOf(v))
 	}
 
-	actual = decorateResponseWriter(&fancyResponseWriter{}, nil, nil, nil)
+	actual = decorateResponseWriter(context.Background(), &fancyResponseWriter{}, nil, nil, nil)
 	switch v := actual.(type) {
 	case *fancyResponseWriterDelegator:
 	default:
@@ -108,7 +110,7 @@ func TestConstructResponseWriter(t *testing.T) {
 
 func TestDecorateResponseWriterWithoutChannel(t *testing.T) {
 	ev := &auditinternal.Event{}
-	actual := decorateResponseWriter(&simpleResponseWriter{}, ev, nil, nil)
+	actual := decorateResponseWriter(context.Background(), &simpleResponseWriter{}, ev, nil, nil)
 
 	// write status. This will not block because firstEventSentCh is nil
 	actual.WriteHeader(42)
@@ -122,7 +124,7 @@ func TestDecorateResponseWriterWithoutChannel(t *testing.T) {
 
 func TestDecorateResponseWriterWithImplicitWrite(t *testing.T) {
 	ev := &auditinternal.Event{}
-	actual := decorateResponseWriter(&simpleResponseWriter{}, ev, nil, nil)
+	actual := decorateResponseWriter(context.Background(), &simpleResponseWriter{}, ev, nil, nil)
 
 	// write status. This will not block because firstEventSentCh is nil
 	actual.Write([]byte("foo"))
@@ -137,7 +139,7 @@ func TestDecorateResponseWriterWithImplicitWrite(t *testing.T) {
 func TestDecorateResponseWriterChannel(t *testing.T) {
 	sink := &fakeAuditSink{}
 	ev := &auditinternal.Event{}
-	actual := decorateResponseWriter(&simpleResponseWriter{}, ev, sink, nil)
+	actual := decorateResponseWriter(context.Background(), &simpleResponseWriter{}, ev, sink, nil)
 
 	done := make(chan struct{})
 	go func() {
@@ -222,7 +224,7 @@ func TestAudit(t *testing.T) {
 			"short running with auditID",
 			shortRunningPath,
 			"GET",
-			uuid.NewRandom().String(),
+			uuid.New().String(),
 			nil,
 			func(w http.ResponseWriter, req *http.Request) {
 				w.Write([]byte("foo"))
@@ -421,7 +423,7 @@ func TestAudit(t *testing.T) {
 			"empty longrunning with audit id",
 			longRunningPath,
 			"GET",
-			uuid.NewRandom().String(),
+			uuid.New().String(),
 			nil,
 			func(w http.ResponseWriter, req *http.Request) {
 				w.Write([]byte("foo"))
@@ -695,7 +697,7 @@ func TestAudit(t *testing.T) {
 			expectedID := types.UID("")
 			for i, expect := range test.expected {
 				event := events[i]
-				if "admin" != event.User.Username {
+				if event.User.Username != "admin" {
 					t.Errorf("Unexpected username: %s", event.User.Username)
 				}
 				if event.Stage != expect.Stage {
@@ -777,7 +779,7 @@ func TestAuditIDHttpHeader(t *testing.T) {
 		},
 		{
 			"no http header when there is no audit even the request header specified",
-			uuid.NewRandom().String(),
+			uuid.New().String(),
 			auditinternal.LevelNone,
 			false,
 		},
@@ -789,7 +791,7 @@ func TestAuditIDHttpHeader(t *testing.T) {
 		},
 		{
 			"user provided header",
-			uuid.NewRandom().String(),
+			uuid.New().String(),
 			auditinternal.LevelRequestResponse,
 			true,
 		},

@@ -32,6 +32,7 @@ import (
 	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/apis/core/validation"
 	volumevalidation "k8s.io/kubernetes/pkg/volume/validation"
+	"sigs.k8s.io/structured-merge-diff/v4/fieldpath"
 )
 
 // persistentvolumeStrategy implements behavior for PersistentVolume objects
@@ -48,12 +49,24 @@ func (persistentvolumeStrategy) NamespaceScoped() bool {
 	return false
 }
 
+// GetResetFields returns the set of fields that get reset by the strategy
+// and should not be modified by the user.
+func (persistentvolumeStrategy) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	fields := map[fieldpath.APIVersion]*fieldpath.Set{
+		"v1": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("status"),
+		),
+	}
+
+	return fields
+}
+
 // ResetBeforeCreate clears the Status field which is not allowed to be set by end users on creation.
 func (persistentvolumeStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
 	pv := obj.(*api.PersistentVolume)
 	pv.Status = api.PersistentVolumeStatus{}
 
-	pvutil.DropDisabledAlphaFields(&pv.Spec)
+	pvutil.DropDisabledFields(&pv.Spec, nil)
 }
 
 func (persistentvolumeStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
@@ -76,8 +89,7 @@ func (persistentvolumeStrategy) PrepareForUpdate(ctx context.Context, obj, old r
 	oldPv := old.(*api.PersistentVolume)
 	newPv.Status = oldPv.Status
 
-	pvutil.DropDisabledAlphaFields(&newPv.Spec)
-	pvutil.DropDisabledAlphaFields(&oldPv.Spec)
+	pvutil.DropDisabledFields(&newPv.Spec, &oldPv.Spec)
 }
 
 func (persistentvolumeStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
@@ -97,6 +109,18 @@ type persistentvolumeStatusStrategy struct {
 
 var StatusStrategy = persistentvolumeStatusStrategy{Strategy}
 
+// GetResetFields returns the set of fields that get reset by the strategy
+// and should not be modified by the user.
+func (persistentvolumeStatusStrategy) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	fields := map[fieldpath.APIVersion]*fieldpath.Set{
+		"v1": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("spec"),
+		),
+	}
+
+	return fields
+}
+
 // PrepareForUpdate sets the Spec field which is not allowed to be changed when updating a PV's Status
 func (persistentvolumeStatusStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
 	newPv := obj.(*api.PersistentVolume)
@@ -109,12 +133,12 @@ func (persistentvolumeStatusStrategy) ValidateUpdate(ctx context.Context, obj, o
 }
 
 // GetAttrs returns labels and fields of a given object for filtering purposes.
-func GetAttrs(obj runtime.Object) (labels.Set, fields.Set, bool, error) {
+func GetAttrs(obj runtime.Object) (labels.Set, fields.Set, error) {
 	persistentvolumeObj, ok := obj.(*api.PersistentVolume)
 	if !ok {
-		return nil, nil, false, fmt.Errorf("not a persistentvolume")
+		return nil, nil, fmt.Errorf("not a persistentvolume")
 	}
-	return labels.Set(persistentvolumeObj.Labels), PersistentVolumeToSelectableFields(persistentvolumeObj), persistentvolumeObj.Initializers != nil, nil
+	return labels.Set(persistentvolumeObj.Labels), PersistentVolumeToSelectableFields(persistentvolumeObj), nil
 }
 
 // MatchPersistentVolume returns a generic matcher for a given label and field selector.

@@ -31,7 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	core "k8s.io/client-go/testing"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
-	_ "k8s.io/kubernetes/pkg/apis/extensions/install"
+	_ "k8s.io/kubernetes/pkg/apis/apps/install"
 	cmapi "k8s.io/metrics/pkg/apis/custom_metrics/v1beta2"
 	emapi "k8s.io/metrics/pkg/apis/external_metrics/v1beta1"
 	metricsapi "k8s.io/metrics/pkg/apis/metrics/v1beta1"
@@ -50,12 +50,13 @@ type restClientTestCase struct {
 	targetTimestamp      int
 	window               time.Duration
 	reportedMetricPoints []metricPoint
-	reportedPodMetrics   [][]int64
+	reportedPodMetrics   []map[string]int64
 	singleObject         *autoscalingapi.CrossVersionObjectReference
 
 	namespace           string
 	selector            labels.Selector
 	resourceName        v1.ResourceName
+	container           string
 	metricName          string
 	metricSelector      *metav1.LabelSelector
 	metricLabelSelector labels.Selector
@@ -91,9 +92,9 @@ func (tc *restClientTestCase) prepareTestClient(t *testing.T) (*metricsfake.Clie
 					Window:     metav1.Duration{Duration: tc.window},
 					Containers: []metricsapi.ContainerMetrics{},
 				}
-				for j, cpu := range containers {
+				for containerName, cpu := range containers {
 					cm := metricsapi.ContainerMetrics{
-						Name: fmt.Sprintf("%s-%d-container-%d", podNamePrefix, i, j),
+						Name: containerName,
 						Usage: v1.ResourceList{
 							v1.ResourceCPU: *resource.NewMilliQuantity(
 								cpu,
@@ -230,7 +231,7 @@ func (tc *restClientTestCase) runTest(t *testing.T) {
 	isResource := len(tc.resourceName) > 0
 	isExternal := tc.metricSelector != nil
 	if isResource {
-		info, timestamp, err := metricsClient.GetResourceMetric(v1.ResourceName(tc.resourceName), tc.namespace, tc.selector)
+		info, timestamp, err := metricsClient.GetResourceMetric(v1.ResourceName(tc.resourceName), tc.namespace, tc.selector, tc.container)
 		tc.verifyResults(t, info, timestamp, err)
 	} else if isExternal {
 		tc.metricLabelSelector, err = metav1.LabelSelectorAsSelector(tc.metricSelector)
@@ -253,7 +254,7 @@ func (tc *restClientTestCase) runTest(t *testing.T) {
 	}
 }
 
-func TestRESTClientCPU(t *testing.T) {
+func TestRESTClientPodCPU(t *testing.T) {
 	targetTimestamp := 1
 	window := 30 * time.Second
 	tc := restClientTestCase{
@@ -265,7 +266,25 @@ func TestRESTClientCPU(t *testing.T) {
 		resourceName:       v1.ResourceCPU,
 		targetTimestamp:    targetTimestamp,
 		window:             window,
-		reportedPodMetrics: [][]int64{{5000}, {5000}, {5000}},
+		reportedPodMetrics: []map[string]int64{{"test": 5000}, {"test": 5000}, {"test": 5000}},
+	}
+	tc.runTest(t)
+}
+
+func TestRESTClientContainerCPU(t *testing.T) {
+	targetTimestamp := 1
+	window := 30 * time.Second
+	tc := restClientTestCase{
+		desiredMetricValues: PodMetricsInfo{
+			"test-pod-0": {Value: 5000, Timestamp: offsetTimestampBy(targetTimestamp), Window: window},
+			"test-pod-1": {Value: 5000, Timestamp: offsetTimestampBy(targetTimestamp), Window: window},
+			"test-pod-2": {Value: 5000, Timestamp: offsetTimestampBy(targetTimestamp), Window: window},
+		},
+		container:          "test-1",
+		resourceName:       v1.ResourceCPU,
+		targetTimestamp:    targetTimestamp,
+		window:             window,
+		reportedPodMetrics: []map[string]int64{{"test-1": 5000, "test-2": 500}, {"test-1": 5000, "test-2": 500}, {"test-1": 5000, "test-2": 500}},
 	}
 	tc.runTest(t)
 }
@@ -305,7 +324,7 @@ func TestRESTClientSingleObject(t *testing.T) {
 		targetTimestamp:      1,
 		reportedMetricPoints: []metricPoint{{10, 1}},
 		singleObject: &autoscalingapi.CrossVersionObjectReference{
-			APIVersion: "extensions/v1beta1",
+			APIVersion: "apps/v1",
 			Kind:       "Deployment",
 			Name:       "some-dep",
 		},
@@ -362,17 +381,17 @@ func TestRESTClientExternalEmptyMetrics(t *testing.T) {
 	tc.runTest(t)
 }
 
-func TestRESTClientCPUEmptyMetrics(t *testing.T) {
+func TestRESTClientPodCPUEmptyMetrics(t *testing.T) {
 	tc := restClientTestCase{
 		resourceName:         v1.ResourceCPU,
 		desiredError:         fmt.Errorf("no metrics returned from resource metrics API"),
 		reportedMetricPoints: []metricPoint{},
-		reportedPodMetrics:   [][]int64{},
+		reportedPodMetrics:   []map[string]int64{},
 	}
 	tc.runTest(t)
 }
 
-func TestRESTClientCPUEmptyMetricsForOnePod(t *testing.T) {
+func TestRESTClientPodCPUEmptyMetricsForOnePod(t *testing.T) {
 	targetTimestamp := 1
 	window := 30 * time.Second
 	tc := restClientTestCase{
@@ -383,7 +402,25 @@ func TestRESTClientCPUEmptyMetricsForOnePod(t *testing.T) {
 		},
 		targetTimestamp:    targetTimestamp,
 		window:             window,
-		reportedPodMetrics: [][]int64{{100}, {300, 400}, {}},
+		reportedPodMetrics: []map[string]int64{{"test-1": 100}, {"test-1": 300, "test-2": 400}, {}},
+	}
+	tc.runTest(t)
+}
+
+func TestRESTClientContainerCPUEmptyMetricsForOnePod(t *testing.T) {
+	targetTimestamp := 1
+	window := 30 * time.Second
+	tc := restClientTestCase{
+		resourceName: v1.ResourceCPU,
+		desiredMetricValues: PodMetricsInfo{
+			"test-pod-0": {Value: 100, Timestamp: offsetTimestampBy(targetTimestamp), Window: window},
+			"test-pod-1": {Value: 300, Timestamp: offsetTimestampBy(targetTimestamp), Window: window},
+		},
+		container:          "test-1",
+		targetTimestamp:    targetTimestamp,
+		window:             window,
+		desiredError:       fmt.Errorf("failed to get container metrics"),
+		reportedPodMetrics: []map[string]int64{{"test-1": 100}, {"test-1": 300, "test-2": 400}, {}},
 	}
 	tc.runTest(t)
 }

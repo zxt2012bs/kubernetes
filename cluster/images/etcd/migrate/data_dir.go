@@ -21,16 +21,15 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
 )
 
 // DataDirectory provides utilities for initializing and backing up an
 // etcd "data-dir" as well as managing a version.txt file to track the
-// etcd server version and storage verion of the etcd data in the
+// etcd server version and storage version of the etcd data in the
 // directory.
 type DataDirectory struct {
 	path        string
@@ -45,7 +44,7 @@ func OpenOrCreateDataDirectory(path string) (*DataDirectory, error) {
 		return nil, err
 	}
 	if !exists {
-		glog.Infof("data directory '%s' does not exist, creating it", path)
+		klog.Infof("data directory '%s' does not exist, creating it", path)
 		err := os.MkdirAll(path, 0777)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create data directory %s: %v", path, err)
@@ -67,7 +66,7 @@ func (d *DataDirectory) Initialize(target *EtcdVersionPair) error {
 		return err
 	}
 	if isEmpty {
-		glog.Infof("data directory '%s' is empty, writing target version '%s' to version.txt", d.path, target)
+		klog.Infof("data directory '%s' is empty, writing target version '%s' to version.txt", d.path, target)
 		err = d.versionFile.Write(target)
 		if err != nil {
 			return fmt.Errorf("failed to write version.txt to '%s': %v", d.path, err)
@@ -88,7 +87,7 @@ func (d *DataDirectory) Backup() error {
 	if err != nil {
 		return err
 	}
-	err = exec.Command("cp", "-r", d.path, backupDir).Run()
+	err = copyDirectory(d.path, backupDir)
 	if err != nil {
 		return err
 	}
@@ -116,13 +115,13 @@ func (d *DataDirectory) String() string {
 }
 
 // VersionFile provides utilities for reading and writing version.txt files
-// to etcd "data-dir" for tracking the etcd server and storage verions
+// to etcd "data-dir" for tracking the etcd server and storage versions
 // of the data in the directory.
 type VersionFile struct {
 	path string
 }
 
-// Exists returns true if a version.txt file exists on the filesystem.
+// Exists returns true if a version.txt file exists on the file system.
 func (v *VersionFile) Exists() (bool, error) {
 	return exists(v.path)
 }

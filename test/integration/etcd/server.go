@@ -27,10 +27,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coreos/etcd/clientv3"
-	"github.com/coreos/etcd/clientv3/concurrency"
+	"go.etcd.io/etcd/clientv3"
+	"go.etcd.io/etcd/clientv3/concurrency"
 
-	apiextensionsv1beta1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apiextensionsclientset "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -39,7 +39,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
 	genericapiserveroptions "k8s.io/apiserver/pkg/server/options"
-	cacheddiscovery "k8s.io/client-go/discovery/cached"
+	cacheddiscovery "k8s.io/client-go/discovery/cached/memory"
 	"k8s.io/client-go/dynamic"
 	clientset "k8s.io/client-go/kubernetes"
 	restclient "k8s.io/client-go/rest"
@@ -50,11 +50,11 @@ import (
 	"k8s.io/kubernetes/test/integration/framework"
 
 	// install all APIs
-	_ "k8s.io/kubernetes/pkg/master"
+	_ "k8s.io/kubernetes/pkg/controlplane"
 )
 
 // StartRealMasterOrDie starts an API master that is appropriate for use in tests that require one of every resource
-func StartRealMasterOrDie(t *testing.T) *Master {
+func StartRealMasterOrDie(t *testing.T, configFuncs ...func(*options.ServerRunOptions)) *Master {
 	certDir, err := ioutil.TempDir("", t.Name())
 	if err != nil {
 		t.Fatal(err)
@@ -65,30 +65,30 @@ func StartRealMasterOrDie(t *testing.T) *Master {
 		t.Fatal(err)
 	}
 
-	listener, _, err := genericapiserveroptions.CreateListener("tcp", "127.0.0.1:0")
+	listener, _, err := genericapiserveroptions.CreateListener("tcp", "127.0.0.1:0", net.ListenConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	kubeAPIServerOptions := options.NewServerRunOptions()
-	kubeAPIServerOptions.InsecureServing.BindPort = 0
 	kubeAPIServerOptions.SecureServing.Listener = listener
 	kubeAPIServerOptions.SecureServing.ServerCert.CertDirectory = certDir
-	kubeAPIServerOptions.Etcd.StorageConfig.ServerList = []string{framework.GetEtcdURL()}
+	kubeAPIServerOptions.Etcd.StorageConfig.Transport.ServerList = []string{framework.GetEtcdURL()}
 	kubeAPIServerOptions.Etcd.DefaultStorageMediaType = runtime.ContentTypeJSON // force json we can easily interpret the result in etcd
-	kubeAPIServerOptions.ServiceClusterIPRange = *defaultServiceClusterIPRange
+	kubeAPIServerOptions.ServiceClusterIPRanges = defaultServiceClusterIPRange.String()
 	kubeAPIServerOptions.Authorization.Modes = []string{"RBAC"}
 	kubeAPIServerOptions.Admission.GenericAdmission.DisablePlugins = []string{"ServiceAccount"}
+	kubeAPIServerOptions.APIEnablement.RuntimeConfig["api/all"] = "true"
+	for _, f := range configFuncs {
+		f(kubeAPIServerOptions)
+	}
 	completedOptions, err := app.Complete(kubeAPIServerOptions)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := completedOptions.APIEnablement.RuntimeConfig.Set("api/all=true"); err != nil {
-		t.Fatal(err)
-	}
 
 	// get etcd client before starting API server
-	rawClient, kvClient, err := integration.GetEtcdClients(completedOptions.Etcd.StorageConfig)
+	rawClient, kvClient, err := integration.GetEtcdClients(completedOptions.Etcd.StorageConfig.Transport)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +116,7 @@ func StartRealMasterOrDie(t *testing.T) *Master {
 		t.Fatal(err)
 	}
 
-	kubeClientConfig := restclient.CopyConfig(kubeAPIServer.LoopbackClientConfig)
+	kubeClientConfig := restclient.CopyConfig(kubeAPIServer.GenericAPIServer.LoopbackClientConfig)
 
 	// we make lots of requests, don't be slow
 	kubeClientConfig.QPS = 99999
@@ -132,19 +132,29 @@ func StartRealMasterOrDie(t *testing.T) *Master {
 			}
 		}()
 
-		if err := kubeAPIServer.PrepareRun().Run(stopCh); err != nil {
-			t.Fatal(err)
+		prepared, err := kubeAPIServer.PrepareRun()
+		if err != nil {
+			t.Error(err)
+		}
+		if err := prepared.Run(stopCh); err != nil {
+			t.Error(err)
 		}
 	}()
 
 	lastHealth := ""
+	attempt := 0
 	if err := wait.PollImmediate(time.Second, time.Minute, func() (done bool, err error) {
 		// wait for the server to be healthy
-		result := kubeClient.RESTClient().Get().AbsPath("/healthz").Do()
+		result := kubeClient.RESTClient().Get().AbsPath("/healthz").Do(context.TODO())
 		content, _ := result.Raw()
 		lastHealth = string(content)
 		if errResult := result.Error(); errResult != nil {
-			t.Log(errResult)
+			attempt++
+			if attempt < 10 {
+				t.Log("waiting for server to be healthy")
+			} else {
+				t.Log(errResult)
+			}
 			return false, nil
 		}
 		var status int
@@ -163,7 +173,7 @@ func StartRealMasterOrDie(t *testing.T) *Master {
 	restMapper := restmapper.NewDeferredDiscoveryRESTMapper(discoveryClient)
 	restMapper.Reset()
 
-	serverResources, err := kubeClient.Discovery().ServerResources()
+	_, serverResources, err := kubeClient.Discovery().ServerGroupsAndResources()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,14 +303,14 @@ func JSONToUnstructured(stub, namespace string, mapping *meta.RESTMapping, dynam
 // CreateTestCRDs creates the given CRDs, any failure causes the test to Fatal.
 // If skipCrdExistsInDiscovery is true, the CRDs are only checked for the Established condition via their Status.
 // If skipCrdExistsInDiscovery is false, the CRDs are checked via discovery, see CrdExistsInDiscovery.
-func CreateTestCRDs(t *testing.T, client apiextensionsclientset.Interface, skipCrdExistsInDiscovery bool, crds ...*apiextensionsv1beta1.CustomResourceDefinition) {
+func CreateTestCRDs(t *testing.T, client apiextensionsclientset.Interface, skipCrdExistsInDiscovery bool, crds ...*apiextensionsv1.CustomResourceDefinition) {
 	for _, crd := range crds {
 		createTestCRD(t, client, skipCrdExistsInDiscovery, crd)
 	}
 }
 
-func createTestCRD(t *testing.T, client apiextensionsclientset.Interface, skipCrdExistsInDiscovery bool, crd *apiextensionsv1beta1.CustomResourceDefinition) {
-	if _, err := client.ApiextensionsV1beta1().CustomResourceDefinitions().Create(crd); err != nil {
+func createTestCRD(t *testing.T, client apiextensionsclientset.Interface, skipCrdExistsInDiscovery bool, crd *apiextensionsv1.CustomResourceDefinition) {
+	if _, err := client.ApiextensionsV1().CustomResourceDefinitions().Create(context.TODO(), crd, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("Failed to create %s CRD; %v", crd.Name, err)
 	}
 	if skipCrdExistsInDiscovery {
@@ -318,14 +328,14 @@ func createTestCRD(t *testing.T, client apiextensionsclientset.Interface, skipCr
 
 func waitForEstablishedCRD(client apiextensionsclientset.Interface, name string) error {
 	return wait.PollImmediate(500*time.Millisecond, wait.ForeverTestTimeout, func() (bool, error) {
-		crd, err := client.ApiextensionsV1beta1().CustomResourceDefinitions().Get(name, metav1.GetOptions{})
+		crd, err := client.ApiextensionsV1().CustomResourceDefinitions().Get(context.TODO(), name, metav1.GetOptions{})
 		if err != nil {
 			return false, err
 		}
 		for _, cond := range crd.Status.Conditions {
 			switch cond.Type {
-			case apiextensionsv1beta1.Established:
-				if cond.Status == apiextensionsv1beta1.ConditionTrue {
+			case apiextensionsv1.Established:
+				if cond.Status == apiextensionsv1.ConditionTrue {
 					return true, nil
 				}
 			}
@@ -335,11 +345,8 @@ func waitForEstablishedCRD(client apiextensionsclientset.Interface, name string)
 }
 
 // CrdExistsInDiscovery checks to see if the given CRD exists in discovery at all served versions.
-func CrdExistsInDiscovery(client apiextensionsclientset.Interface, crd *apiextensionsv1beta1.CustomResourceDefinition) bool {
+func CrdExistsInDiscovery(client apiextensionsclientset.Interface, crd *apiextensionsv1.CustomResourceDefinition) bool {
 	var versions []string
-	if len(crd.Spec.Version) != 0 {
-		versions = append(versions, crd.Spec.Version)
-	}
 	for _, v := range crd.Spec.Versions {
 		if v.Served {
 			versions = append(versions, v.Name)
@@ -353,7 +360,7 @@ func CrdExistsInDiscovery(client apiextensionsclientset.Interface, crd *apiexten
 	return true
 }
 
-func crdVersionExistsInDiscovery(client apiextensionsclientset.Interface, crd *apiextensionsv1beta1.CustomResourceDefinition, version string) bool {
+func crdVersionExistsInDiscovery(client apiextensionsclientset.Interface, crd *apiextensionsv1.CustomResourceDefinition, version string) bool {
 	resourceList, err := client.Discovery().ServerResourcesForGroupVersion(crd.Spec.Group + "/" + version)
 	if err != nil {
 		return false

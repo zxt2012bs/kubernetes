@@ -19,15 +19,60 @@ package alpha
 import (
 	"bytes"
 	"fmt"
+	"io/ioutil"
 	"os"
+	"path/filepath"
 	"testing"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/clientcmd"
+	"sigs.k8s.io/yaml"
+
+	kubeadmapiv1beta2 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta2"
 	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	"k8s.io/kubernetes/cmd/kubeadm/app/util/pkiutil"
 	testutil "k8s.io/kubernetes/cmd/kubeadm/test"
 	kubeconfigtestutil "k8s.io/kubernetes/cmd/kubeadm/test/kubeconfig"
 )
+
+func generateTestKubeadmConfig(dir, id, certDir, clusterName string) (string, error) {
+	cfgPath := filepath.Join(dir, id)
+	initCfg := kubeadmapiv1beta2.InitConfiguration{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "kubeadm.k8s.io/v1beta2",
+			Kind:       "InitConfiguration",
+		},
+		LocalAPIEndpoint: kubeadmapiv1beta2.APIEndpoint{
+			AdvertiseAddress: "1.2.3.4",
+			BindPort:         1234,
+		},
+	}
+	clusterCfg := kubeadmapiv1beta2.ClusterConfiguration{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "kubeadm.k8s.io/v1beta2",
+			Kind:       "ClusterConfiguration",
+		},
+		CertificatesDir:   certDir,
+		ClusterName:       clusterName,
+		KubernetesVersion: kubeadmconstants.MinimumControlPlaneVersion.String(),
+	}
+
+	var buf bytes.Buffer
+	data, err := yaml.Marshal(&initCfg)
+	if err != nil {
+		return "", err
+	}
+	buf.Write(data)
+	buf.WriteString("---\n")
+	data, err = yaml.Marshal(&clusterCfg)
+	if err != nil {
+		return "", err
+	}
+	buf.Write(data)
+
+	err = ioutil.WriteFile(cfgPath, buf.Bytes(), 0644)
+	return cfgPath, err
+}
 
 func TestKubeConfigSubCommandsThatWritesToOut(t *testing.T) {
 
@@ -36,7 +81,7 @@ func TestKubeConfigSubCommandsThatWritesToOut(t *testing.T) {
 	defer os.RemoveAll(tmpdir)
 
 	// Adds a pki folder with a ca cert to the temp folder
-	pkidir := testutil.SetupPkiDirWithCertificateAuthorithy(t, tmpdir)
+	pkidir := testutil.SetupPkiDirWithCertificateAuthority(t, tmpdir)
 
 	// Retrieves ca cert for assertions
 	caCert, _, err := pkiutil.TryLoadCertAndKeyFromDisk(pkidir, kubeadmconstants.CACertAndKeyBaseName)
@@ -44,61 +89,87 @@ func TestKubeConfigSubCommandsThatWritesToOut(t *testing.T) {
 		t.Fatalf("couldn't retrieve ca cert: %v", err)
 	}
 
-	commonFlags := []string{
-		"--apiserver-advertise-address=1.2.3.4",
-		"--apiserver-bind-port=1234",
-		"--client-name=myUser",
-		fmt.Sprintf("--cert-dir=%s", pkidir),
-	}
-
 	var tests = []struct {
+		name            string
 		command         string
+		clusterName     string
 		withClientCert  bool
 		withToken       bool
 		additionalFlags []string
 	}{
-		{ // Test user subCommand withClientCert
+		{
+			name:           "user subCommand withClientCert",
 			command:        "user",
 			withClientCert: true,
 		},
-		{ // Test user subCommand withToken
+		{
+			name:           "user subCommand withClientCert",
+			command:        "user",
+			withClientCert: true,
+			clusterName:    "my-cluster",
+		},
+		{
+			name:            "user subCommand withToken",
 			withToken:       true,
 			command:         "user",
+			additionalFlags: []string{"--token=123456"},
+		},
+		{
+			name:            "user subCommand withToken",
+			withToken:       true,
+			command:         "user",
+			clusterName:     "my-cluster-with-token",
 			additionalFlags: []string{"--token=123456"},
 		},
 	}
 
 	for _, test := range tests {
-		buf := new(bytes.Buffer)
+		t.Run(test.name, func(t *testing.T) {
+			buf := new(bytes.Buffer)
 
-		// Get subcommands working in the temporary directory
-		cmd := newCmdUserKubeConfig(buf)
+			// Get subcommands working in the temporary directory
+			cmd := newCmdUserKubeConfig(buf)
 
-		// Execute the subcommand
-		allFlags := append(commonFlags, test.additionalFlags...)
-		cmd.SetArgs(allFlags)
-		if err := cmd.Execute(); err != nil {
-			t.Fatal("Could not execute subcommand")
-		}
+			cfgPath, err := generateTestKubeadmConfig(tmpdir, test.name, pkidir, test.clusterName)
+			if err != nil {
+				t.Fatalf("Failed to generate kubeadm config: %v", err)
+			}
 
-		// reads kubeconfig written to stdout
-		config, err := clientcmd.Load(buf.Bytes())
-		if err != nil {
-			t.Errorf("couldn't read kubeconfig file from buffer: %v", err)
-			continue
-		}
+			commonFlags := []string{
+				"--client-name=myUser",
+				fmt.Sprintf("--config=%s", cfgPath),
+			}
 
-		// checks that CLI flags are properly propagated
-		kubeconfigtestutil.AssertKubeConfigCurrentCluster(t, config, "https://1.2.3.4:1234", caCert)
+			// Execute the subcommand
+			allFlags := append(commonFlags, test.additionalFlags...)
+			cmd.SetArgs(allFlags)
+			if err := cmd.Execute(); err != nil {
+				t.Fatalf("Could not execute subcommand: %v", err)
+			}
 
-		if test.withClientCert {
-			// checks that kubeconfig files have expected client cert
-			kubeconfigtestutil.AssertKubeConfigCurrentAuthInfoWithClientCert(t, config, caCert, "myUser")
-		}
+			// reads kubeconfig written to stdout
+			config, err := clientcmd.Load(buf.Bytes())
+			if err != nil {
+				t.Fatalf("couldn't read kubeconfig file from buffer: %v", err)
+			}
 
-		if test.withToken {
-			// checks that kubeconfig files have expected token
-			kubeconfigtestutil.AssertKubeConfigCurrentAuthInfoWithToken(t, config, "myUser", "123456")
-		}
+			// checks that CLI flags are properly propagated
+			kubeconfigtestutil.AssertKubeConfigCurrentCluster(t, config, "https://1.2.3.4:1234", caCert)
+
+			if test.withClientCert {
+				// checks that kubeconfig files have expected client cert
+				kubeconfigtestutil.AssertKubeConfigCurrentAuthInfoWithClientCert(t, config, caCert, "myUser")
+			}
+
+			if test.withToken {
+				// checks that kubeconfig files have expected token
+				kubeconfigtestutil.AssertKubeConfigCurrentAuthInfoWithToken(t, config, "myUser", "123456")
+			}
+
+			if len(test.clusterName) > 0 {
+				// checks that kubeconfig files have expected cluster name
+				kubeconfigtestutil.AssertKubeConfigCurrentContextWithClusterName(t, config, test.clusterName)
+			}
+		})
 	}
 }

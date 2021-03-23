@@ -22,7 +22,7 @@ import (
 	"os"
 	"sync"
 
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
 )
 
 // Factory is a function that returns a cloudprovider.Interface.
@@ -42,11 +42,8 @@ var (
 	}{
 		{"aws", false, "The AWS provider is deprecated and will be removed in a future release"},
 		{"azure", false, "The Azure provider is deprecated and will be removed in a future release"},
-		{"cloudstack", false, "The CloudStack Controller project is no longer maintained."},
 		{"gce", false, "The GCE provider is deprecated and will be removed in a future release"},
 		{"openstack", true, "https://github.com/kubernetes/cloud-provider-openstack"},
-		{"ovirt", false, "The ovirt Controller project is no longer maintained."},
-		{"photon", false, "The Photon Controller project is no longer maintained."},
 		{"vsphere", false, "The vSphere provider is deprecated and will be removed in a future release"},
 	}
 )
@@ -59,9 +56,9 @@ func RegisterCloudProvider(name string, cloud Factory) {
 	providersMutex.Lock()
 	defer providersMutex.Unlock()
 	if _, found := providers[name]; found {
-		glog.Fatalf("Cloud provider %q was registered twice", name)
+		klog.Fatalf("Cloud provider %q was registered twice", name)
 	}
-	glog.V(1).Infof("Registered cloud provider %q", name)
+	klog.V(1).Infof("Registered cloud provider %q", name)
 	providers[name] = cloud
 }
 
@@ -94,38 +91,41 @@ func IsExternal(name string) bool {
 	return name == externalCloudProvider
 }
 
+func DeprecationWarningForProvider(providerName string) {
+	for _, provider := range deprecatedCloudProviders {
+		if provider.name != providerName {
+			continue
+		}
+
+		detail := provider.detail
+		if provider.external {
+			detail = fmt.Sprintf("Please use 'external' cloud provider for %s: %s", providerName, provider.detail)
+		}
+
+		klog.Warningf("WARNING: %s built-in cloud provider is now deprecated. %s", providerName, detail)
+		break
+	}
+}
+
 // InitCloudProvider creates an instance of the named cloud provider.
 func InitCloudProvider(name string, configFilePath string) (Interface, error) {
 	var cloud Interface
 	var err error
 
 	if name == "" {
-		glog.Info("No cloud provider specified.")
 		return nil, nil
 	}
 
 	if IsExternal(name) {
-		glog.Info("External cloud provider specified")
+		klog.Info("External cloud provider specified")
 		return nil, nil
-	}
-
-	for _, provider := range deprecatedCloudProviders {
-		if provider.name == name {
-			detail := provider.detail
-			if provider.external {
-				detail = fmt.Sprintf("Please use 'external' cloud provider for %s: %s", name, provider.detail)
-			}
-			glog.Warningf("WARNING: %s built-in cloud provider is now deprecated. %s", name, detail)
-
-			break
-		}
 	}
 
 	if configFilePath != "" {
 		var config *os.File
 		config, err = os.Open(configFilePath)
 		if err != nil {
-			glog.Fatalf("Couldn't open cloud provider configuration %s: %#v",
+			klog.Fatalf("Couldn't open cloud provider configuration %s: %#v",
 				configFilePath, err)
 		}
 

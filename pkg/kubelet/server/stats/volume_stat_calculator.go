@@ -17,28 +17,32 @@ limitations under the License.
 package stats
 
 import (
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
-	stats "k8s.io/kubernetes/pkg/kubelet/apis/stats/v1alpha1"
-	"k8s.io/kubernetes/pkg/kubelet/util/format"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/client-go/tools/record"
+	"k8s.io/klog/v2"
+	stats "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
+	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/volume"
-
-	"github.com/golang/glog"
+	"k8s.io/kubernetes/pkg/volume/util"
 )
 
 // volumeStatCalculator calculates volume metrics for a given pod periodically in the background and caches the result
 type volumeStatCalculator struct {
-	statsProvider StatsProvider
+	statsProvider Provider
 	jitterPeriod  time.Duration
 	pod           *v1.Pod
 	stopChannel   chan struct{}
 	startO        sync.Once
 	stopO         sync.Once
 	latest        atomic.Value
+	eventRecorder record.EventRecorder
 }
 
 // PodVolumeStats encapsulates the VolumeStats for a pod.
@@ -49,12 +53,13 @@ type PodVolumeStats struct {
 }
 
 // newVolumeStatCalculator creates a new VolumeStatCalculator
-func newVolumeStatCalculator(statsProvider StatsProvider, jitterPeriod time.Duration, pod *v1.Pod) *volumeStatCalculator {
+func newVolumeStatCalculator(statsProvider Provider, jitterPeriod time.Duration, pod *v1.Pod, eventRecorder record.EventRecorder) *volumeStatCalculator {
 	return &volumeStatCalculator{
 		statsProvider: statsProvider,
 		jitterPeriod:  jitterPeriod,
 		pod:           pod,
 		stopChannel:   make(chan struct{}),
+		eventRecorder: eventRecorder,
 	}
 }
 
@@ -79,11 +84,11 @@ func (s *volumeStatCalculator) StopOnce() *volumeStatCalculator {
 
 // getLatest returns the most recent PodVolumeStats from the cache
 func (s *volumeStatCalculator) GetLatest() (PodVolumeStats, bool) {
-	if result := s.latest.Load(); result == nil {
+	result := s.latest.Load()
+	if result == nil {
 		return PodVolumeStats{}, false
-	} else {
-		return result.(PodVolumeStats), true
 	}
+	return result.(PodVolumeStats), true
 }
 
 // calcAndStoreStats calculates PodVolumeStats for a given pod and writes the result to the s.latest cache.
@@ -102,14 +107,14 @@ func (s *volumeStatCalculator) calcAndStoreStats() {
 	}
 
 	// Call GetMetrics on each Volume and copy the result to a new VolumeStats.FsStats
-	ephemeralStats := []stats.VolumeStats{}
-	persistentStats := []stats.VolumeStats{}
+	var ephemeralStats []stats.VolumeStats
+	var persistentStats []stats.VolumeStats
 	for name, v := range volumes {
 		metric, err := v.GetMetrics()
 		if err != nil {
 			// Expected for Volumes that don't support Metrics
 			if !volume.IsNotSupported(err) {
-				glog.V(4).Infof("Failed to calculate volume metrics for pod %s volume %s: %+v", format.Pod(s.pod), name, err)
+				klog.V(4).InfoS("Failed to calculate volume metrics", "pod", klog.KObj(s.pod), "podUID", s.pod.UID, "volumeName", name, "err", err)
 			}
 			continue
 		}
@@ -123,12 +128,17 @@ func (s *volumeStatCalculator) calcAndStoreStats() {
 			}
 		}
 		volumeStats := s.parsePodVolumeStats(name, pvcRef, metric, volSpec)
-		if isVolumeEphemeral(volSpec) {
+		if util.IsLocalEphemeralVolume(volSpec) {
 			ephemeralStats = append(ephemeralStats, volumeStats)
 		} else {
 			persistentStats = append(persistentStats, volumeStats)
 		}
 
+		if utilfeature.DefaultFeatureGate.Enabled(features.CSIVolumeHealth) {
+			if metric.Abnormal != nil && metric.Message != nil && (*metric.Abnormal) {
+				s.eventRecorder.Event(s.pod, v1.EventTypeWarning, "VolumeConditionAbnormal", fmt.Sprintf("Volume %s: %s", name, *metric.Message))
+			}
+		}
 	}
 
 	// Store the new stats
@@ -138,12 +148,26 @@ func (s *volumeStatCalculator) calcAndStoreStats() {
 
 // parsePodVolumeStats converts (internal) volume.Metrics to (external) stats.VolumeStats structures
 func (s *volumeStatCalculator) parsePodVolumeStats(podName string, pvcRef *stats.PVCReference, metric *volume.Metrics, volSpec v1.Volume) stats.VolumeStats {
-	available := uint64(metric.Available.Value())
-	capacity := uint64(metric.Capacity.Value())
-	used := uint64(metric.Used.Value())
-	inodes := uint64(metric.Inodes.Value())
-	inodesFree := uint64(metric.InodesFree.Value())
-	inodesUsed := uint64(metric.InodesUsed.Value())
+
+	var available, capacity, used, inodes, inodesFree, inodesUsed uint64
+	if metric.Available != nil {
+		available = uint64(metric.Available.Value())
+	}
+	if metric.Capacity != nil {
+		capacity = uint64(metric.Capacity.Value())
+	}
+	if metric.Used != nil {
+		used = uint64(metric.Used.Value())
+	}
+	if metric.Inodes != nil {
+		inodes = uint64(metric.Inodes.Value())
+	}
+	if metric.InodesFree != nil {
+		inodesFree = uint64(metric.InodesFree.Value())
+	}
+	if metric.InodesUsed != nil {
+		inodesUsed = uint64(metric.InodesUsed.Value())
+	}
 
 	return stats.VolumeStats{
 		Name:   podName,
@@ -151,12 +175,4 @@ func (s *volumeStatCalculator) parsePodVolumeStats(podName string, pvcRef *stats
 		FsStats: stats.FsStats{Time: metric.Time, AvailableBytes: &available, CapacityBytes: &capacity,
 			UsedBytes: &used, Inodes: &inodes, InodesFree: &inodesFree, InodesUsed: &inodesUsed},
 	}
-}
-
-func isVolumeEphemeral(volume v1.Volume) bool {
-	if (volume.EmptyDir != nil && volume.EmptyDir.Medium == v1.StorageMediumDefault) ||
-		volume.ConfigMap != nil || volume.GitRepo != nil {
-		return true
-	}
-	return false
 }

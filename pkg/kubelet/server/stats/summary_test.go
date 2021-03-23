@@ -27,7 +27,7 @@ import (
 
 	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	statsapi "k8s.io/kubernetes/pkg/kubelet/apis/stats/v1alpha1"
+	statsapi "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 	"k8s.io/kubernetes/pkg/kubelet/cm"
 	statstest "k8s.io/kubernetes/pkg/kubelet/server/stats/testing"
 )
@@ -74,6 +74,7 @@ func TestSummaryProviderGetStats(t *testing.T) {
 		On("GetNodeConfig").Return(nodeConfig).
 		On("GetPodCgroupRoot").Return(cgroupRoot).
 		On("ListPodStats").Return(podStats, nil).
+		On("ListPodStatsAndUpdateCPUNanoCoreUsage").Return(podStats, nil).
 		On("ImageFsStats").Return(imageFsStats, nil).
 		On("RootFsStats").Return(rootFsStats, nil).
 		On("RlimitStats").Return(rlimitStats, nil).
@@ -83,12 +84,14 @@ func TestSummaryProviderGetStats(t *testing.T) {
 		On("GetCgroupStats", "/kubelet", false).Return(cgroupStatsMap["/kubelet"].cs, cgroupStatsMap["/kubelet"].ns, nil).
 		On("GetCgroupStats", "/kubepods", true).Return(cgroupStatsMap["/pods"].cs, cgroupStatsMap["/pods"].ns, nil)
 
-	provider := NewSummaryProvider(mockStatsProvider)
+	kubeletCreationTime := metav1.Now()
+	systemBootTime := metav1.Now()
+	provider := summaryProviderImpl{kubeletCreationTime: kubeletCreationTime, systemBootTime: systemBootTime, provider: mockStatsProvider}
 	summary, err := provider.Get(true)
 	assert.NoError(err)
 
 	assert.Equal(summary.Node.NodeName, "test-node")
-	assert.Equal(summary.Node.StartTime, cgroupStatsMap["/"].cs.StartTime)
+	assert.Equal(summary.Node.StartTime, systemBootTime)
 	assert.Equal(summary.Node.CPU, cgroupStatsMap["/"].cs.CPU)
 	assert.Equal(summary.Node.Memory, cgroupStatsMap["/"].cs.Memory)
 	assert.Equal(summary.Node.Network, cgroupStatsMap["/"].ns)
@@ -98,7 +101,7 @@ func TestSummaryProviderGetStats(t *testing.T) {
 	assert.Equal(len(summary.Node.SystemContainers), 4)
 	assert.Contains(summary.Node.SystemContainers, statsapi.ContainerStats{
 		Name:               "kubelet",
-		StartTime:          cgroupStatsMap["/kubelet"].cs.StartTime,
+		StartTime:          kubeletCreationTime,
 		CPU:                cgroupStatsMap["/kubelet"].cs.CPU,
 		Memory:             cgroupStatsMap["/kubelet"].cs.Memory,
 		Accelerators:       cgroupStatsMap["/kubelet"].cs.Accelerators,

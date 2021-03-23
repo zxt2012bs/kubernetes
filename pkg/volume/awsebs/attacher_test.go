@@ -1,3 +1,5 @@
+// +build !providerless
+
 /*
 Copyright 2016 The Kubernetes Authors.
 
@@ -20,18 +22,18 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/kubernetes/pkg/cloudprovider/providers/aws"
 	"k8s.io/kubernetes/pkg/volume"
 	volumetest "k8s.io/kubernetes/pkg/volume/testing"
+	"k8s.io/legacy-cloud-providers/aws"
 )
 
 func TestGetVolumeName_Volume(t *testing.T) {
-	plugin := newPlugin()
+	plugin := newPlugin(t)
 	name := aws.KubernetesVolumeID("my-aws-volume")
 	spec := createVolSpec(name, false)
 
@@ -45,7 +47,7 @@ func TestGetVolumeName_Volume(t *testing.T) {
 }
 
 func TestGetVolumeName_PersistentVolume(t *testing.T) {
-	plugin := newPlugin()
+	plugin := newPlugin(t)
 	name := aws.KubernetesVolumeID("my-aws-pv")
 	spec := createPVSpec(name, true)
 
@@ -60,7 +62,7 @@ func TestGetVolumeName_PersistentVolume(t *testing.T) {
 
 // One testcase for TestAttachDetach table test below
 type testcase struct {
-	name aws.KubernetesVolumeID
+	name string
 	// For fake AWS:
 	attach attachCall
 	detach detachCall
@@ -126,22 +128,23 @@ func TestAttachDetach(t *testing.T) {
 	}
 
 	for _, testcase := range tests {
-		testcase.t = t
-		device, err := testcase.test(&testcase)
-		if err != testcase.expectedError {
-			t.Errorf("%s failed: expected err=%q, got %q", testcase.name, testcase.expectedError.Error(), err.Error())
-		}
-		if device != testcase.expectedDevice {
-			t.Errorf("%s failed: expected device=%q, got %q", testcase.name, testcase.expectedDevice, device)
-		}
-		t.Logf("Test %q succeeded", testcase.name)
+		t.Run(testcase.name, func(t *testing.T) {
+			testcase.t = t
+			device, err := testcase.test(&testcase)
+			if err != testcase.expectedError {
+				t.Errorf("failed: expected err=%q, got %q", testcase.expectedError.Error(), err.Error())
+			}
+			if device != testcase.expectedDevice {
+				t.Errorf("failed: expected device=%q, got %q", testcase.expectedDevice, device)
+			}
+		})
 	}
 }
 
 // newPlugin creates a new gcePersistentDiskPlugin with fake cloud, NewAttacher
 // and NewDetacher won't work.
-func newPlugin() *awsElasticBlockStorePlugin {
-	host := volumetest.NewFakeVolumeHost("/tmp", nil, nil)
+func newPlugin(t *testing.T) *awsElasticBlockStorePlugin {
+	host := volumetest.NewFakeVolumeHost(t, "/tmp", nil, nil)
 	plugins := ProbeVolumePlugins()
 	plugin := plugins[0]
 	plugin.Init(host)
@@ -205,13 +208,6 @@ type detachCall struct {
 	ret           error
 }
 
-type diskIsAttachedCall struct {
-	diskName   aws.KubernetesVolumeID
-	nodeName   types.NodeName
-	isAttached bool
-	ret        error
-}
-
 func (testcase *testcase) AttachDisk(diskName aws.KubernetesVolumeID, nodeName types.NodeName) (string, error) {
 	expected := &testcase.attach
 
@@ -232,7 +228,7 @@ func (testcase *testcase) AttachDisk(diskName aws.KubernetesVolumeID, nodeName t
 		return "", errors.New("Unexpected AttachDisk call: wrong nodeName")
 	}
 
-	glog.V(4).Infof("AttachDisk call: %s, %s, returning %q, %v", diskName, nodeName, expected.retDeviceName, expected.ret)
+	klog.V(4).Infof("AttachDisk call: %s, %s, returning %q, %v", diskName, nodeName, expected.retDeviceName, expected.ret)
 
 	return expected.retDeviceName, expected.ret
 }
@@ -257,7 +253,7 @@ func (testcase *testcase) DetachDisk(diskName aws.KubernetesVolumeID, nodeName t
 		return "", errors.New("Unexpected DetachDisk call: wrong nodeName")
 	}
 
-	glog.V(4).Infof("DetachDisk call: %s, %s, returning %q, %v", diskName, nodeName, expected.retDeviceName, expected.ret)
+	klog.V(4).Infof("DetachDisk call: %s, %s, returning %q, %v", diskName, nodeName, expected.retDeviceName, expected.ret)
 
 	return expected.retDeviceName, expected.ret
 }

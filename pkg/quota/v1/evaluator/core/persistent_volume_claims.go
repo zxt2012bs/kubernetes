@@ -24,18 +24,14 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/util/initialization"
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apiserver/pkg/admission"
-	"k8s.io/apiserver/pkg/features"
+	quota "k8s.io/apiserver/pkg/quota/v1"
+	"k8s.io/apiserver/pkg/quota/v1/generic"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	storagehelpers "k8s.io/component-helpers/storage/volume"
 	api "k8s.io/kubernetes/pkg/apis/core"
 	k8s_api_v1 "k8s.io/kubernetes/pkg/apis/core/v1"
-	"k8s.io/kubernetes/pkg/apis/core/v1/helper"
 	k8sfeatures "k8s.io/kubernetes/pkg/features"
-	"k8s.io/kubernetes/pkg/kubeapiserver/admission/util"
-	quota "k8s.io/kubernetes/pkg/quota/v1"
-	"k8s.io/kubernetes/pkg/quota/v1/generic"
 )
 
 // the name used for object count quota
@@ -99,25 +95,9 @@ func (p *pvcEvaluator) Handles(a admission.Attributes) bool {
 		return true
 	}
 	if op == admission.Update && utilfeature.DefaultFeatureGate.Enabled(k8sfeatures.ExpandPersistentVolumes) {
-		initialized, err := initialization.IsObjectInitialized(a.GetObject())
-		if err != nil {
-			// fail closed, will try to give an evaluation.
-			utilruntime.HandleError(err)
-			return true
-		}
-		// only handle the update if the object is initialized after the update.
-		return initialized
-	}
-	// TODO: when the ExpandPersistentVolumes feature gate is removed, remove
-	// the initializationCompletion check as well, because it will become a
-	// subset of the "initialized" condition.
-	initializationCompletion, err := util.IsInitializationCompletion(a)
-	if err != nil {
-		// fail closed, will try to give an evaluation.
-		utilruntime.HandleError(err)
 		return true
 	}
-	return initializationCompletion
+	return false
 }
 
 // Matches returns true if the evaluator matches the specified quota with the provided input item
@@ -150,7 +130,7 @@ func (p *pvcEvaluator) MatchingResources(items []corev1.ResourceName) []corev1.R
 			result = append(result, item)
 			continue
 		}
-		// match pvc resources scoped by storage class (<storage-class-name>.storage-class.kubernetes.io/<resource>)
+		// match pvc resources scoped by storage class (<storage-class-name>.storageclass.storage.k8s.io/<resource>)
 		for _, resource := range pvcResources {
 			byStorageClass := storageClassSuffix + string(resource)
 			if strings.HasSuffix(string(item), byStorageClass) {
@@ -173,13 +153,7 @@ func (p *pvcEvaluator) Usage(item runtime.Object) (corev1.ResourceList, error) {
 	// charge for claim
 	result[corev1.ResourcePersistentVolumeClaims] = *(resource.NewQuantity(1, resource.DecimalSI))
 	result[pvcObjectCountName] = *(resource.NewQuantity(1, resource.DecimalSI))
-	if utilfeature.DefaultFeatureGate.Enabled(features.Initializers) {
-		if !initialization.IsInitialized(pvc.Initializers) {
-			// Only charge pvc count for uninitialized pvc.
-			return result, nil
-		}
-	}
-	storageClassRef := helper.GetPersistentVolumeClaimClass(pvc)
+	storageClassRef := storagehelpers.GetPersistentVolumeClaimClass(pvc)
 	if len(storageClassRef) > 0 {
 		storageClassClaim := corev1.ResourceName(storageClassRef + storageClassSuffix + string(corev1.ResourcePersistentVolumeClaims))
 		result[storageClassClaim] = *(resource.NewQuantity(1, resource.DecimalSI))
@@ -187,6 +161,13 @@ func (p *pvcEvaluator) Usage(item runtime.Object) (corev1.ResourceList, error) {
 
 	// charge for storage
 	if request, found := pvc.Spec.Resources.Requests[corev1.ResourceStorage]; found {
+		roundedRequest := request.DeepCopy()
+		if !roundedRequest.RoundUp(0) {
+			// Ensure storage requests are counted as whole byte values, to pass resourcequota validation.
+			// See http://issue.k8s.io/94313
+			request = roundedRequest
+		}
+
 		result[corev1.ResourceRequestsStorage] = request
 		// charge usage to the storage class (if present)
 		if len(storageClassRef) > 0 {

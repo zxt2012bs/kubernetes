@@ -34,7 +34,7 @@ func TestGroupVersionUnmarshalJSON(t *testing.T) {
 		expect GroupVersion
 	}{
 		{[]byte(`{"val": "v1"}`), GroupVersion{"", "v1"}},
-		{[]byte(`{"val": "extensions/v1beta1"}`), GroupVersion{"extensions", "v1beta1"}},
+		{[]byte(`{"val": "apps/v1"}`), GroupVersion{"apps", "v1"}},
 	}
 
 	for _, c := range cases {
@@ -47,7 +47,7 @@ func TestGroupVersionUnmarshalJSON(t *testing.T) {
 			t.Errorf("JSON codec failed to unmarshal input '%s': expected %+v, got %+v", c.input, c.expect, result.GV)
 		}
 		// test the json-iterator codec
-		iter := json.CaseSensitiveJsonIterator()
+		iter := json.CaseSensitiveJSONIterator()
 		if err := iter.Unmarshal(c.input, &result); err != nil {
 			t.Errorf("json-iterator codec failed to unmarshal input '%v': %v", c.input, err)
 		}
@@ -63,7 +63,7 @@ func TestGroupVersionMarshalJSON(t *testing.T) {
 		expect []byte
 	}{
 		{GroupVersion{"", "v1"}, []byte(`{"val":"v1"}`)},
-		{GroupVersion{"extensions", "v1beta1"}, []byte(`{"val":"extensions/v1beta1"}`)},
+		{GroupVersion{"apps", "v1"}, []byte(`{"val":"apps/v1"}`)},
 	}
 
 	for _, c := range cases {

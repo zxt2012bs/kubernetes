@@ -20,14 +20,16 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -36,21 +38,26 @@ import (
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	core "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/record"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 
 	// TODO: remove this import if
 	// api.Registry.GroupOrDie(v1.GroupName).GroupVersions[0].String() is changed
 	// to "v1"?
 
 	_ "k8s.io/kubernetes/pkg/apis/core/install"
+	"k8s.io/kubernetes/pkg/features"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	containertest "k8s.io/kubernetes/pkg/kubelet/container/testing"
-	"k8s.io/kubernetes/pkg/kubelet/server/portforward"
-	"k8s.io/kubernetes/pkg/kubelet/server/remotecommand"
-	"k8s.io/kubernetes/pkg/util/mount"
+	"k8s.io/kubernetes/pkg/kubelet/cri/streaming/portforward"
+	"k8s.io/kubernetes/pkg/kubelet/cri/streaming/remotecommand"
+	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
+	"k8s.io/kubernetes/pkg/volume/util/hostutil"
+	"k8s.io/kubernetes/pkg/volume/util/subpath"
 )
 
 func TestDisabledSubpath(t *testing.T) {
-	fm := &mount.FakeMounter{}
+	fhu := hostutil.NewFakeHostUtil(nil)
+	fsp := &subpath.FakeSubpath{}
 	pod := v1.Pod{
 		Spec: v1.PodSpec{
 			HostNetwork: true,
@@ -91,11 +98,9 @@ func TestDisabledSubpath(t *testing.T) {
 		},
 	}
 
-	utilfeature.DefaultFeatureGate.Set("VolumeSubpath=false")
-	defer utilfeature.DefaultFeatureGate.Set("VolumeSubpath=true")
-
+	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.VolumeSubpath, false)()
 	for name, test := range cases {
-		_, _, err := makeMounts(&pod, "/pod", &test.container, "fakepodname", "", "", podVolumes, fm, nil)
+		_, _, err := makeMounts(&pod, "/pod", &test.container, "fakepodname", "", []string{}, podVolumes, fhu, fsp, nil, false)
 		if err != nil && !test.expectError {
 			t.Errorf("test %v failed: %v", name, err)
 		}
@@ -183,9 +188,7 @@ fe00::2	ip6-allrouters
 123.45.67.89	some.domain
 
 # Entries added by HostAliases.
-123.45.67.89	foo
-123.45.67.89	bar
-123.45.67.89	baz
+123.45.67.89	foo	bar	baz
 `,
 		},
 		{
@@ -214,12 +217,8 @@ fe00::2	ip6-allrouters
 12.34.56.78	another.domain
 
 # Entries added by HostAliases.
-123.45.67.89	foo
-123.45.67.89	bar
-123.45.67.89	baz
-456.78.90.123	park
-456.78.90.123	doo
-456.78.90.123	boo
+123.45.67.89	foo	bar	baz
+456.78.90.123	park	doo	boo
 `,
 		},
 	}
@@ -247,14 +246,14 @@ func writeHostsFile(filename string, cfg string) (string, error) {
 
 func TestManagedHostsFileContent(t *testing.T) {
 	testCases := []struct {
-		hostIP          string
+		hostIPs         []string
 		hostName        string
 		hostDomainName  string
 		hostAliases     []v1.HostAlias
 		expectedContent string
 	}{
 		{
-			"123.45.67.89",
+			[]string{"123.45.67.89"},
 			"podFoo",
 			"",
 			[]v1.HostAlias{},
@@ -269,7 +268,7 @@ fe00::2	ip6-allrouters
 `,
 		},
 		{
-			"203.0.113.1",
+			[]string{"203.0.113.1"},
 			"podFoo",
 			"domainFoo",
 			[]v1.HostAlias{},
@@ -284,7 +283,7 @@ fe00::2	ip6-allrouters
 `,
 		},
 		{
-			"203.0.113.1",
+			[]string{"203.0.113.1"},
 			"podFoo",
 			"domainFoo",
 			[]v1.HostAlias{
@@ -300,13 +299,11 @@ fe00::2	ip6-allrouters
 203.0.113.1	podFoo.domainFoo	podFoo
 
 # Entries added by HostAliases.
-123.45.67.89	foo
-123.45.67.89	bar
-123.45.67.89	baz
+123.45.67.89	foo	bar	baz
 `,
 		},
 		{
-			"203.0.113.1",
+			[]string{"203.0.113.1"},
 			"podFoo",
 			"domainFoo",
 			[]v1.HostAlias{
@@ -323,18 +320,30 @@ fe00::2	ip6-allrouters
 203.0.113.1	podFoo.domainFoo	podFoo
 
 # Entries added by HostAliases.
-123.45.67.89	foo
-123.45.67.89	bar
-123.45.67.89	baz
-456.78.90.123	park
-456.78.90.123	doo
-456.78.90.123	boo
+123.45.67.89	foo	bar	baz
+456.78.90.123	park	doo	boo
+`,
+		},
+		{
+			[]string{"203.0.113.1", "fd00::6"},
+			"podFoo",
+			"domainFoo",
+			[]v1.HostAlias{},
+			`# Kubernetes-managed hosts file.
+127.0.0.1	localhost
+::1	localhost ip6-localhost ip6-loopback
+fe00::0	ip6-localnet
+fe00::0	ip6-mcastprefix
+fe00::1	ip6-allnodes
+fe00::2	ip6-allrouters
+203.0.113.1	podFoo.domainFoo	podFoo
+fd00::6	podFoo.domainFoo	podFoo
 `,
 		},
 	}
 
 	for _, testCase := range testCases {
-		actualContent := managedHostsFileContent(testCase.hostIP, testCase.hostName, testCase.hostDomainName, testCase.hostAliases)
+		actualContent := managedHostsFileContent(testCase.hostIPs, testCase.hostName, testCase.hostDomainName, testCase.hostAliases)
 		assert.Equal(t, testCase.expectedContent, string(actualContent), "hosts file content not expected")
 	}
 }
@@ -387,7 +396,7 @@ func TestRunInContainer(t *testing.T) {
 		actualOutput, err := kubelet.RunInContainer("podFoo_nsFoo", "", "containerFoo", cmd)
 		assert.Equal(t, containerID, fakeCommandRunner.ContainerID, "(testError=%v) ID", testError)
 		assert.Equal(t, cmd, fakeCommandRunner.Cmd, "(testError=%v) command", testError)
-		// this isn't 100% foolproof as a bug in a real ContainerCommandRunner where it fails to copy to stdout/stderr wouldn't be caught by this test
+		// this isn't 100% foolproof as a bug in a real CommandRunner where it fails to copy to stdout/stderr wouldn't be caught by this test
 		assert.Equal(t, "foo", string(actualOutput), "(testError=%v) output", testError)
 		assert.Equal(t, err, testError, "(testError=%v) err", testError)
 	}
@@ -439,13 +448,17 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 		buildService("not-special", "kubernetes", "", "TCP", 8088),
 	}
 
+	trueValue := true
+	falseValue := false
 	testCases := []struct {
 		name               string                 // the name of the test case
 		ns                 string                 // the namespace to generate environment for
-		enableServiceLinks bool                   // enabling service links
+		enableServiceLinks *bool                  // enabling service links
 		container          *v1.Container          // the container to use
 		masterServiceNs    string                 // the namespace to read master service info from
 		nilLister          bool                   // whether the lister should be nil
+		staticPod          bool                   // whether the pod should be a static pod (versus an API pod)
+		unsyncedServices   bool                   // whether the services should NOT be synced
 		configMap          *v1.ConfigMap          // an optional ConfigMap to pull from
 		secret             *v1.Secret             // an optional Secret to pull from
 		expectedEnvs       []kubecontainer.EnvVar // a set of expected environment vars
@@ -453,9 +466,31 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 		expectedEvent      string                 // does the test emit an event
 	}{
 		{
+			name:               "if services aren't synced, non-static pods should fail",
+			ns:                 "test1",
+			enableServiceLinks: &falseValue,
+			container:          &v1.Container{Env: []v1.EnvVar{}},
+			masterServiceNs:    metav1.NamespaceDefault,
+			nilLister:          false,
+			staticPod:          false,
+			unsyncedServices:   true,
+			expectedEnvs:       []kubecontainer.EnvVar{},
+			expectedError:      true,
+		},
+		{
+			name:               "if services aren't synced, static pods should succeed", // if there is no service
+			ns:                 "test1",
+			enableServiceLinks: &falseValue,
+			container:          &v1.Container{Env: []v1.EnvVar{}},
+			masterServiceNs:    metav1.NamespaceDefault,
+			nilLister:          false,
+			staticPod:          true,
+			unsyncedServices:   true,
+		},
+		{
 			name:               "api server = Y, kubelet = Y",
 			ns:                 "test1",
-			enableServiceLinks: false,
+			enableServiceLinks: &falseValue,
 			container: &v1.Container{
 				Env: []v1.EnvVar{
 					{Name: "FOO", Value: "BAR"},
@@ -491,7 +526,7 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 		{
 			name:               "api server = Y, kubelet = N",
 			ns:                 "test1",
-			enableServiceLinks: false,
+			enableServiceLinks: &falseValue,
 			container: &v1.Container{
 				Env: []v1.EnvVar{
 					{Name: "FOO", Value: "BAR"},
@@ -520,7 +555,7 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 		{
 			name:               "api server = N; kubelet = Y",
 			ns:                 "test1",
-			enableServiceLinks: false,
+			enableServiceLinks: &falseValue,
 			container: &v1.Container{
 				Env: []v1.EnvVar{
 					{Name: "FOO", Value: "BAZ"},
@@ -542,7 +577,7 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 		{
 			name:               "api server = N; kubelet = Y; service env vars",
 			ns:                 "test1",
-			enableServiceLinks: true,
+			enableServiceLinks: &trueValue,
 			container: &v1.Container{
 				Env: []v1.EnvVar{
 					{Name: "FOO", Value: "BAZ"},
@@ -571,7 +606,7 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 		{
 			name:               "master service in pod ns",
 			ns:                 "test2",
-			enableServiceLinks: false,
+			enableServiceLinks: &falseValue,
 			container: &v1.Container{
 				Env: []v1.EnvVar{
 					{Name: "FOO", Value: "ZAP"},
@@ -593,7 +628,7 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 		{
 			name:               "master service in pod ns, service env vars",
 			ns:                 "test2",
-			enableServiceLinks: true,
+			enableServiceLinks: &trueValue,
 			container: &v1.Container{
 				Env: []v1.EnvVar{
 					{Name: "FOO", Value: "ZAP"},
@@ -622,7 +657,7 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 		{
 			name:               "pod in master service ns",
 			ns:                 "kubernetes",
-			enableServiceLinks: false,
+			enableServiceLinks: &falseValue,
 			container:          &v1.Container{},
 			masterServiceNs:    "kubernetes",
 			nilLister:          false,
@@ -639,7 +674,7 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 		{
 			name:               "pod in master service ns, service env vars",
 			ns:                 "kubernetes",
-			enableServiceLinks: true,
+			enableServiceLinks: &trueValue,
 			container:          &v1.Container{},
 			masterServiceNs:    "kubernetes",
 			nilLister:          false,
@@ -663,7 +698,7 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 		{
 			name:               "downward api pod",
 			ns:                 "downward-api",
-			enableServiceLinks: false,
+			enableServiceLinks: &falseValue,
 			container: &v1.Container{
 				Env: []v1.EnvVar{
 					{
@@ -712,6 +747,15 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 						},
 					},
 					{
+						Name: "POD_IPS",
+						ValueFrom: &v1.EnvVarSource{
+							FieldRef: &v1.ObjectFieldSelector{
+								APIVersion: "v1",
+								FieldPath:  "status.podIPs",
+							},
+						},
+					},
+					{
 						Name: "HOST_IP",
 						ValueFrom: &v1.EnvVarSource{
 							FieldRef: &v1.ObjectFieldSelector{
@@ -730,13 +774,14 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 				{Name: "POD_NODE_NAME", Value: "node-name"},
 				{Name: "POD_SERVICE_ACCOUNT_NAME", Value: "special"},
 				{Name: "POD_IP", Value: "1.2.3.4"},
+				{Name: "POD_IPS", Value: "1.2.3.4,fd00::6"},
 				{Name: "HOST_IP", Value: testKubeletHostIP},
 			},
 		},
 		{
 			name:               "env expansion",
 			ns:                 "test1",
-			enableServiceLinks: false,
+			enableServiceLinks: &falseValue,
 			container: &v1.Container{
 				Env: []v1.EnvVar{
 					{
@@ -832,7 +877,7 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 		{
 			name:               "env expansion, service env vars",
 			ns:                 "test1",
-			enableServiceLinks: true,
+			enableServiceLinks: &trueValue,
 			container: &v1.Container{
 				Env: []v1.EnvVar{
 					{
@@ -964,7 +1009,7 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 		{
 			name:               "configmapkeyref_missing_optional",
 			ns:                 "test",
-			enableServiceLinks: false,
+			enableServiceLinks: &falseValue,
 			container: &v1.Container{
 				Env: []v1.EnvVar{
 					{
@@ -985,7 +1030,7 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 		{
 			name:               "configmapkeyref_missing_key_optional",
 			ns:                 "test",
-			enableServiceLinks: false,
+			enableServiceLinks: &falseValue,
 			container: &v1.Container{
 				Env: []v1.EnvVar{
 					{
@@ -1016,7 +1061,7 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 		{
 			name:               "secretkeyref_missing_optional",
 			ns:                 "test",
-			enableServiceLinks: false,
+			enableServiceLinks: &falseValue,
 			container: &v1.Container{
 				Env: []v1.EnvVar{
 					{
@@ -1037,7 +1082,7 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 		{
 			name:               "secretkeyref_missing_key_optional",
 			ns:                 "test",
-			enableServiceLinks: false,
+			enableServiceLinks: &falseValue,
 			container: &v1.Container{
 				Env: []v1.EnvVar{
 					{
@@ -1068,7 +1113,7 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 		{
 			name:               "configmap",
 			ns:                 "test1",
-			enableServiceLinks: false,
+			enableServiceLinks: &falseValue,
 			container: &v1.Container{
 				EnvFrom: []v1.EnvFromSource{
 					{
@@ -1136,7 +1181,7 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 		{
 			name:               "configmap, service env vars",
 			ns:                 "test1",
-			enableServiceLinks: true,
+			enableServiceLinks: &trueValue,
 			container: &v1.Container{
 				EnvFrom: []v1.EnvFromSource{
 					{
@@ -1232,7 +1277,7 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 		{
 			name:               "configmap_missing",
 			ns:                 "test1",
-			enableServiceLinks: false,
+			enableServiceLinks: &falseValue,
 			container: &v1.Container{
 				EnvFrom: []v1.EnvFromSource{
 					{ConfigMapRef: &v1.ConfigMapEnvSource{LocalObjectReference: v1.LocalObjectReference{Name: "test-config-map"}}},
@@ -1244,7 +1289,7 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 		{
 			name:               "configmap_missing_optional",
 			ns:                 "test",
-			enableServiceLinks: false,
+			enableServiceLinks: &falseValue,
 			container: &v1.Container{
 				EnvFrom: []v1.EnvFromSource{
 					{ConfigMapRef: &v1.ConfigMapEnvSource{
@@ -1258,7 +1303,7 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 		{
 			name:               "configmap_invalid_keys",
 			ns:                 "test",
-			enableServiceLinks: false,
+			enableServiceLinks: &falseValue,
 			container: &v1.Container{
 				EnvFrom: []v1.EnvFromSource{
 					{ConfigMapRef: &v1.ConfigMapEnvSource{LocalObjectReference: v1.LocalObjectReference{Name: "test-config-map"}}},
@@ -1287,7 +1332,7 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 		{
 			name:               "configmap_invalid_keys_valid",
 			ns:                 "test",
-			enableServiceLinks: false,
+			enableServiceLinks: &falseValue,
 			container: &v1.Container{
 				EnvFrom: []v1.EnvFromSource{
 					{
@@ -1316,7 +1361,7 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 		{
 			name:               "secret",
 			ns:                 "test1",
-			enableServiceLinks: false,
+			enableServiceLinks: &falseValue,
 			container: &v1.Container{
 				EnvFrom: []v1.EnvFromSource{
 					{
@@ -1384,7 +1429,7 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 		{
 			name:               "secret, service env vars",
 			ns:                 "test1",
-			enableServiceLinks: true,
+			enableServiceLinks: &trueValue,
 			container: &v1.Container{
 				EnvFrom: []v1.EnvFromSource{
 					{
@@ -1480,7 +1525,7 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 		{
 			name:               "secret_missing",
 			ns:                 "test1",
-			enableServiceLinks: false,
+			enableServiceLinks: &falseValue,
 			container: &v1.Container{
 				EnvFrom: []v1.EnvFromSource{
 					{SecretRef: &v1.SecretEnvSource{LocalObjectReference: v1.LocalObjectReference{Name: "test-secret"}}},
@@ -1492,7 +1537,7 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 		{
 			name:               "secret_missing_optional",
 			ns:                 "test",
-			enableServiceLinks: false,
+			enableServiceLinks: &falseValue,
 			container: &v1.Container{
 				EnvFrom: []v1.EnvFromSource{
 					{SecretRef: &v1.SecretEnvSource{
@@ -1506,7 +1551,7 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 		{
 			name:               "secret_invalid_keys",
 			ns:                 "test",
-			enableServiceLinks: false,
+			enableServiceLinks: &falseValue,
 			container: &v1.Container{
 				EnvFrom: []v1.EnvFromSource{
 					{SecretRef: &v1.SecretEnvSource{LocalObjectReference: v1.LocalObjectReference{Name: "test-secret"}}},
@@ -1535,7 +1580,7 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 		{
 			name:               "secret_invalid_keys_valid",
 			ns:                 "test",
-			enableServiceLinks: false,
+			enableServiceLinks: &falseValue,
 			container: &v1.Container{
 				EnvFrom: []v1.EnvFromSource{
 					{
@@ -1561,73 +1606,109 @@ func TestMakeEnvironmentVariables(t *testing.T) {
 				},
 			},
 		},
+		{
+			name:               "nil_enableServiceLinks",
+			ns:                 "test",
+			enableServiceLinks: nil,
+			container: &v1.Container{
+				EnvFrom: []v1.EnvFromSource{
+					{
+						Prefix:    "p_",
+						SecretRef: &v1.SecretEnvSource{LocalObjectReference: v1.LocalObjectReference{Name: "test-secret"}},
+					},
+				},
+			},
+			masterServiceNs: "",
+			secret: &v1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "test1",
+					Name:      "test-secret",
+				},
+				Data: map[string][]byte{
+					"1234.name": []byte("abc"),
+				},
+			},
+			expectedError: true,
+		},
 	}
 
 	for _, tc := range testCases {
-		fakeRecorder := record.NewFakeRecorder(1)
-		testKubelet := newTestKubelet(t, false /* controllerAttachDetachEnabled */)
-		testKubelet.kubelet.recorder = fakeRecorder
-		defer testKubelet.Cleanup()
-		kl := testKubelet.kubelet
-		kl.masterServiceNamespace = tc.masterServiceNs
-		if tc.nilLister {
-			kl.serviceLister = nil
-		} else {
-			kl.serviceLister = testServiceLister{services}
-		}
-
-		testKubelet.fakeKubeClient.AddReactor("get", "configmaps", func(action core.Action) (bool, runtime.Object, error) {
-			var err error
-			if tc.configMap == nil {
-				err = apierrors.NewNotFound(action.GetResource().GroupResource(), "configmap-name")
+		t.Run(tc.name, func(t *testing.T) {
+			fakeRecorder := record.NewFakeRecorder(1)
+			testKubelet := newTestKubelet(t, false /* controllerAttachDetachEnabled */)
+			testKubelet.kubelet.recorder = fakeRecorder
+			defer testKubelet.Cleanup()
+			kl := testKubelet.kubelet
+			kl.masterServiceNamespace = tc.masterServiceNs
+			if tc.nilLister {
+				kl.serviceLister = nil
+			} else if tc.unsyncedServices {
+				kl.serviceLister = testServiceLister{}
+				kl.serviceHasSynced = func() bool { return false }
+			} else {
+				kl.serviceLister = testServiceLister{services}
+				kl.serviceHasSynced = func() bool { return true }
 			}
-			return true, tc.configMap, err
-		})
-		testKubelet.fakeKubeClient.AddReactor("get", "secrets", func(action core.Action) (bool, runtime.Object, error) {
-			var err error
-			if tc.secret == nil {
-				err = apierrors.NewNotFound(action.GetResource().GroupResource(), "secret-name")
+
+			testKubelet.fakeKubeClient.AddReactor("get", "configmaps", func(action core.Action) (bool, runtime.Object, error) {
+				var err error
+				if tc.configMap == nil {
+					err = apierrors.NewNotFound(action.GetResource().GroupResource(), "configmap-name")
+				}
+				return true, tc.configMap, err
+			})
+			testKubelet.fakeKubeClient.AddReactor("get", "secrets", func(action core.Action) (bool, runtime.Object, error) {
+				var err error
+				if tc.secret == nil {
+					err = apierrors.NewNotFound(action.GetResource().GroupResource(), "secret-name")
+				}
+				return true, tc.secret, err
+			})
+
+			testKubelet.fakeKubeClient.AddReactor("get", "secrets", func(action core.Action) (bool, runtime.Object, error) {
+				var err error
+				if tc.secret == nil {
+					err = errors.New("no secret defined")
+				}
+				return true, tc.secret, err
+			})
+
+			testPod := &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace:   tc.ns,
+					Name:        "dapi-test-pod-name",
+					Annotations: map[string]string{},
+				},
+				Spec: v1.PodSpec{
+					ServiceAccountName: "special",
+					NodeName:           "node-name",
+					EnableServiceLinks: tc.enableServiceLinks,
+				},
 			}
-			return true, tc.secret, err
-		})
-
-		testKubelet.fakeKubeClient.AddReactor("get", "secrets", func(action core.Action) (bool, runtime.Object, error) {
-			var err error
-			if tc.secret == nil {
-				err = errors.New("no secret defined")
+			podIP := "1.2.3.4"
+			podIPs := []string{"1.2.3.4,fd00::6"}
+			if tc.staticPod {
+				testPod.Annotations[kubetypes.ConfigSourceAnnotationKey] = "file"
 			}
-			return true, tc.secret, err
+
+			result, err := kl.makeEnvironmentVariables(testPod, tc.container, podIP, podIPs)
+			select {
+			case e := <-fakeRecorder.Events:
+				assert.Equal(t, tc.expectedEvent, e)
+			default:
+				assert.Equal(t, "", tc.expectedEvent)
+			}
+			if tc.expectedError {
+				assert.Error(t, err, tc.name)
+			} else {
+				assert.NoError(t, err, "[%s]", tc.name)
+
+				sort.Sort(envs(result))
+				sort.Sort(envs(tc.expectedEnvs))
+				assert.Equal(t, tc.expectedEnvs, result, "[%s] env entries", tc.name)
+			}
 		})
 
-		testPod := &v1.Pod{
-			ObjectMeta: metav1.ObjectMeta{
-				Namespace: tc.ns,
-				Name:      "dapi-test-pod-name",
-			},
-			Spec: v1.PodSpec{
-				ServiceAccountName: "special",
-				NodeName:           "node-name",
-				EnableServiceLinks: &tc.enableServiceLinks,
-			},
-		}
-		podIP := "1.2.3.4"
-
-		result, err := kl.makeEnvironmentVariables(testPod, tc.container, podIP)
-		select {
-		case e := <-fakeRecorder.Events:
-			assert.Equal(t, tc.expectedEvent, e)
-		default:
-			assert.Equal(t, "", tc.expectedEvent)
-		}
-		if tc.expectedError {
-			assert.Error(t, err, tc.name)
-		} else {
-			assert.NoError(t, err, "[%s]", tc.name)
-
-			sort.Sort(envs(result))
-			sort.Sort(envs(tc.expectedEnvs))
-			assert.Equal(t, tc.expectedEnvs, result, "[%s] env entries", tc.name)
-		}
 	}
 }
 
@@ -2002,20 +2083,6 @@ func TestPodPhaseWithRestartOnFailure(t *testing.T) {
 	}
 }
 
-type fakeReadWriteCloser struct{}
-
-func (f *fakeReadWriteCloser) Write(data []byte) (int, error) {
-	return 0, nil
-}
-
-func (f *fakeReadWriteCloser) Read(data []byte) (int, error) {
-	return 0, nil
-}
-
-func (f *fakeReadWriteCloser) Close() error {
-	return nil
-}
-
 func TestGetExec(t *testing.T) {
 	const (
 		podName                = "podFoo"
@@ -2354,5 +2421,261 @@ func TestTruncatePodHostname(t *testing.T) {
 		output, err := truncatePodHostnameIfNeeded("test-pod", test.input)
 		assert.NoError(t, err)
 		assert.Equal(t, test.output, output)
+	}
+}
+
+func TestGenerateAPIPodStatusHostNetworkPodIPs(t *testing.T) {
+	testcases := []struct {
+		name          string
+		dualStack     bool
+		nodeAddresses []v1.NodeAddress
+		criPodIPs     []string
+		podIPs        []v1.PodIP
+	}{
+		{
+			name: "Simple",
+			nodeAddresses: []v1.NodeAddress{
+				{Type: v1.NodeInternalIP, Address: "10.0.0.1"},
+			},
+			podIPs: []v1.PodIP{
+				{IP: "10.0.0.1"},
+			},
+		},
+		{
+			name: "InternalIP is preferred over ExternalIP",
+			nodeAddresses: []v1.NodeAddress{
+				{Type: v1.NodeExternalIP, Address: "192.168.0.1"},
+				{Type: v1.NodeInternalIP, Address: "10.0.0.1"},
+			},
+			podIPs: []v1.PodIP{
+				{IP: "10.0.0.1"},
+			},
+		},
+		{
+			name: "Dual-stack addresses are ignored in single-stack cluster",
+			nodeAddresses: []v1.NodeAddress{
+				{Type: v1.NodeInternalIP, Address: "10.0.0.1"},
+				{Type: v1.NodeInternalIP, Address: "fd01::1234"},
+			},
+			podIPs: []v1.PodIP{
+				{IP: "10.0.0.1"},
+			},
+		},
+		{
+			name: "Single-stack addresses in dual-stack cluster",
+			nodeAddresses: []v1.NodeAddress{
+				{Type: v1.NodeInternalIP, Address: "10.0.0.1"},
+			},
+			dualStack: true,
+			podIPs: []v1.PodIP{
+				{IP: "10.0.0.1"},
+			},
+		},
+		{
+			name: "Multiple single-stack addresses in dual-stack cluster",
+			nodeAddresses: []v1.NodeAddress{
+				{Type: v1.NodeInternalIP, Address: "10.0.0.1"},
+				{Type: v1.NodeInternalIP, Address: "10.0.0.2"},
+				{Type: v1.NodeExternalIP, Address: "192.168.0.1"},
+			},
+			dualStack: true,
+			podIPs: []v1.PodIP{
+				{IP: "10.0.0.1"},
+			},
+		},
+		{
+			name: "Dual-stack addresses in dual-stack cluster",
+			nodeAddresses: []v1.NodeAddress{
+				{Type: v1.NodeInternalIP, Address: "10.0.0.1"},
+				{Type: v1.NodeInternalIP, Address: "fd01::1234"},
+			},
+			dualStack: true,
+			podIPs: []v1.PodIP{
+				{IP: "10.0.0.1"},
+				{IP: "fd01::1234"},
+			},
+		},
+		{
+			name: "CRI PodIPs override NodeAddresses",
+			nodeAddresses: []v1.NodeAddress{
+				{Type: v1.NodeInternalIP, Address: "10.0.0.1"},
+				{Type: v1.NodeInternalIP, Address: "fd01::1234"},
+			},
+			dualStack: true,
+			criPodIPs: []string{"192.168.0.1"},
+			podIPs: []v1.PodIP{
+				{IP: "192.168.0.1"},
+			},
+		},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			testKubelet := newTestKubelet(t, false /* controllerAttachDetachEnabled */)
+			defer testKubelet.Cleanup()
+			kl := testKubelet.kubelet
+
+			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.IPv6DualStack, tc.dualStack)()
+
+			kl.nodeLister = testNodeLister{nodes: []*v1.Node{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: string(kl.nodeName)},
+					Status: v1.NodeStatus{
+						Addresses: tc.nodeAddresses,
+					},
+				},
+			}}
+
+			pod := podWithUIDNameNs("12345", "test-pod", "test-namespace")
+			pod.Spec.HostNetwork = true
+
+			criStatus := &kubecontainer.PodStatus{
+				ID:        pod.UID,
+				Name:      pod.Name,
+				Namespace: pod.Namespace,
+				IPs:       tc.criPodIPs,
+			}
+
+			status := kl.generateAPIPodStatus(pod, criStatus)
+			if !reflect.DeepEqual(status.PodIPs, tc.podIPs) {
+				t.Fatalf("Expected PodIPs %#v, got %#v", tc.podIPs, status.PodIPs)
+			}
+			if tc.criPodIPs == nil && status.HostIP != status.PodIPs[0].IP {
+				t.Fatalf("Expected HostIP %q to equal PodIPs[0].IP %q", status.HostIP, status.PodIPs[0].IP)
+			}
+		})
+	}
+}
+
+func TestGenerateAPIPodStatusPodIPs(t *testing.T) {
+	testcases := []struct {
+		name      string
+		nodeIP    string
+		criPodIPs []string
+		podIPs    []v1.PodIP
+	}{
+		{
+			name:      "Simple",
+			nodeIP:    "",
+			criPodIPs: []string{"10.0.0.1"},
+			podIPs: []v1.PodIP{
+				{IP: "10.0.0.1"},
+			},
+		},
+		{
+			name:      "Dual-stack",
+			nodeIP:    "",
+			criPodIPs: []string{"10.0.0.1", "fd01::1234"},
+			podIPs: []v1.PodIP{
+				{IP: "10.0.0.1"},
+				{IP: "fd01::1234"},
+			},
+		},
+		{
+			name:      "Dual-stack with explicit node IP",
+			nodeIP:    "192.168.1.1",
+			criPodIPs: []string{"10.0.0.1", "fd01::1234"},
+			podIPs: []v1.PodIP{
+				{IP: "10.0.0.1"},
+				{IP: "fd01::1234"},
+			},
+		},
+		{
+			name:      "Dual-stack with CRI returning wrong family first",
+			nodeIP:    "",
+			criPodIPs: []string{"fd01::1234", "10.0.0.1"},
+			podIPs: []v1.PodIP{
+				{IP: "10.0.0.1"},
+				{IP: "fd01::1234"},
+			},
+		},
+		{
+			name:      "Dual-stack with explicit node IP with CRI returning wrong family first",
+			nodeIP:    "192.168.1.1",
+			criPodIPs: []string{"fd01::1234", "10.0.0.1"},
+			podIPs: []v1.PodIP{
+				{IP: "10.0.0.1"},
+				{IP: "fd01::1234"},
+			},
+		},
+		{
+			name:      "Dual-stack with IPv6 node IP",
+			nodeIP:    "fd00::5678",
+			criPodIPs: []string{"10.0.0.1", "fd01::1234"},
+			podIPs: []v1.PodIP{
+				{IP: "fd01::1234"},
+				{IP: "10.0.0.1"},
+			},
+		},
+		{
+			name:      "Dual-stack with IPv6 node IP, other CRI order",
+			nodeIP:    "fd00::5678",
+			criPodIPs: []string{"fd01::1234", "10.0.0.1"},
+			podIPs: []v1.PodIP{
+				{IP: "fd01::1234"},
+				{IP: "10.0.0.1"},
+			},
+		},
+		{
+			name:      "No Pod IP matching Node IP",
+			nodeIP:    "fd00::5678",
+			criPodIPs: []string{"10.0.0.1"},
+			podIPs: []v1.PodIP{
+				{IP: "10.0.0.1"},
+			},
+		},
+		{
+			name:      "No Pod IP matching (unspecified) Node IP",
+			nodeIP:    "",
+			criPodIPs: []string{"fd01::1234"},
+			podIPs: []v1.PodIP{
+				{IP: "fd01::1234"},
+			},
+		},
+		{
+			name:      "Multiple IPv4 IPs",
+			nodeIP:    "",
+			criPodIPs: []string{"10.0.0.1", "10.0.0.2", "10.0.0.3"},
+			podIPs: []v1.PodIP{
+				{IP: "10.0.0.1"},
+			},
+		},
+		{
+			name:      "Multiple Dual-Stack IPs",
+			nodeIP:    "",
+			criPodIPs: []string{"10.0.0.1", "10.0.0.2", "fd01::1234", "10.0.0.3", "fd01::5678"},
+			podIPs: []v1.PodIP{
+				{IP: "10.0.0.1"},
+				{IP: "fd01::1234"},
+			},
+		},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			testKubelet := newTestKubelet(t, false /* controllerAttachDetachEnabled */)
+			defer testKubelet.Cleanup()
+			kl := testKubelet.kubelet
+			if tc.nodeIP != "" {
+				kl.nodeIPs = []net.IP{net.ParseIP(tc.nodeIP)}
+			}
+
+			pod := podWithUIDNameNs("12345", "test-pod", "test-namespace")
+
+			criStatus := &kubecontainer.PodStatus{
+				ID:        pod.UID,
+				Name:      pod.Name,
+				Namespace: pod.Namespace,
+				IPs:       tc.criPodIPs,
+			}
+
+			status := kl.generateAPIPodStatus(pod, criStatus)
+			if !reflect.DeepEqual(status.PodIPs, tc.podIPs) {
+				t.Fatalf("Expected PodIPs %#v, got %#v", tc.podIPs, status.PodIPs)
+			}
+			if status.PodIP != status.PodIPs[0].IP {
+				t.Fatalf("Expected PodIP %q to equal PodIPs[0].IP %q", status.PodIP, status.PodIPs[0].IP)
+			}
+		})
 	}
 }
